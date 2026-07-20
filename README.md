@@ -1,105 +1,80 @@
 # LiteShell
 
-LiteShell is a small, long-lived native Windows shell. Filesystem commands run
-inside the shell process, avoiding the repeated process startup and endpoint
-inspection cost of short-lived command-line tools.
+LiteShell is a small native Windows shell implemented in Rust. Ratatui owns the
+interactive UI, including output scrollback, editing, completion, status, and the
+built-in pager. Redirected input/output uses a plain, ANSI-free command stream.
 
-The MVP targets Windows 10/11 and is built directly with Microsoft `cl.exe`.
-It has no PowerShell profile, plugin scan, daemon, managed runtime, or startup
-script dependency.
+## Requirements
 
-## Features
+- Rust 1.82 or newer
+- `x86_64-pc-windows-msvc` toolchain
+- [`just`](https://github.com/casey/just) (optional command runner)
 
-- OpenTUI native C ABI renderer for the prompt and completion surface; the legacy
-  repaint renderer has been removed.
-- Native line editor: Backspace, Delete, arrows, Home/End, history,
-  Ctrl-C, Ctrl-L, and selectable Tab completion.
-- `fff` 0.10.0 C ABI indexing: directory candidates for `cd`, mixed candidates
-  for `ls`, file search through `find`, and indexed content search through `rg`.
-- Completion candidates render above the prompt; Up/Down selects, Tab/Enter
-  accepts, and Esc closes the surface.
-- Flicker-reduced single-frame prompt redraw while preserving terminal scrollback.
-- Persistent UTF-8 history under `%LOCALAPPDATA%\LiteShell\history`.
-- In-process `cd`, `pwd`, `ls`, `cat`, `tail`, `less`, `clear`, and `which`.
-- Keyboard and mouse-wheel navigation in the built-in `less` pager.
-- Single/double quotes, simple quote escaping, `$VAR`, `${VAR}`, `%VAR%`, and `~`.
-- Unicode and space-containing Windows paths.
-- Foreground `.exe`, `.com`, `.cmd`, `.bat`, and `.ps1` launching.
-- Direct terminal inheritance for interactive tools such as `ssh`, `nvim`, and
-  `codex`, followed by console-mode restoration.
-- Compile-time prompt, history, and display configuration in `config.h`.
+No C++ compiler, OpenTUI, PowerShell build script, Node, Bun, or async runtime is
+required.
 
-Pipes, redirects, jobs, scripting, aliases, plugins, ConPTY sessions, and
-background processes are intentionally outside this MVP.
+## Build and test
 
-## Build
-
-Open an x64 Visual Studio Developer PowerShell and run:
-
-```powershell
-.\build.ps1
+```text
+just build
+just test
+just release
 ```
 
-The executable is written to `build\release\liteshell.exe`. Debug builds are
-available with:
+Equivalent Cargo commands are:
 
-```powershell
-.\build.ps1 -Configuration Debug
+```text
+cargo build -p liteshell
+cargo test --workspace
+cargo build --release -p liteshell
 ```
 
-Release builds use the static CRT, whole-program optimization, and link-time code
-generation. The build downloads the pinned official OpenTUI 0.4.5 and `fff`
-0.10.0 Windows x64 DLLs once, verifies their published hashes, and copies them
-beside LiteShell. OpenTUI is required for interactive startup; `fff_c.dll` is
-loaded lazily by the first indexed completion/search. Bun, Node, npm, Cargo, and
-Zig are not required.
+Create `build/release` with the pinned `fff_c.dll` and license:
+
+```text
+just package
+```
+
+Dependency downloads happen only in the explicit `xtask` command, never in a
+Cargo build script.
 
 ## Run
 
-```powershell
-.\build\release\liteshell.exe
+```text
+cargo run -p liteshell
 ```
 
-Examples:
+Interactive mode uses a plain-text, bounded transcript with a divider between
+command/response groups. The first prompt begins at the top and each subsequent
+prompt follows the preceding response, matching a conventional shell's continuous
+flow. The two-line prompt follows Starship's default style, completion opens as a
+fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
+statusline occupies the bottom row. Page Up/Down and the mouse wheel navigate the
+transcript.
+`less` supports arrows, `j`/`k`, pages, `g`/`G`, and `q`. Foreground applications
+temporarily own the console; LiteShell restores Ratatui when they exit.
+
+When either standard input or output is redirected, lines are parsed and run
+without terminal initialization or ANSI escapes:
 
 ```text
-ls -la
-cd "D:\path with spaces"
-find renderer
-rg OpenTUI
-cat README.md
-tail -n 50 build.log
-less report.txt
-nvim .
-ssh host
-codex
-exit
+(echo pwd& echo exit) | target\release\liteshell.exe
 ```
 
-## Configure
+## Commands
 
-Edit [`src/config.h`](src/config.h), then rebuild. It controls:
+`cd`, `pwd`, `ls`, `cat`, `tail`, `less`, `clear`, `which`, `find`, `rg`, `help`,
+`exit`, and foreground `.exe`, `.com`, `.cmd`, `.bat`, and `.ps1` commands.
 
-- prompt style and `{cwd}`, `{leaf}`, `{drive}`, `{user}` formatting;
-- history capacity and location;
-- default `tail` line count and other small static limits.
+## Architecture
 
-See [`docs/configuration.md`](docs/configuration.md) for examples.
+- `liteshell-core`: parser, editor, history, shell state, and output/search traits
+- `liteshell-builtins`: modular in-process commands
+- `liteshell-tui`: Ratatui rendering and terminal lifecycle
+- `liteshell-windows`: command resolution and foreground process launch
+- `liteshell-fff`: isolated optional DLL loading and safe search facade
+- `liteshell`: interactive/non-interactive application
+- `xtask`: verified dependency acquisition and packaging
 
-## Test
-
-```powershell
-.\build.ps1
-.\tests\smoke.ps1
-.\tests\interactive.ps1
-```
-
-The smoke suite covers Unicode/quoted paths, `fff` path/content search, filesystem
-builtins, history persistence, binary detection, and all five external file dispatch
-types. The hidden-console integration test drives the real Win32 line editor,
-selectable completion surface, and pager with key events. A final manual check is
-still recommended in the target Windows Terminal/Sophos environment.
-
-Project design and requirement evidence are documented under [`docs/`](docs/),
-including the [`PRD traceability matrix`](docs/prd-traceability.md) and
-[`OpenTUI C ABI MVP design`](docs/opentui-c-abi-mvp.md).
+See [`docs/rust-ratatui-migration-plan.md`](docs/rust-ratatui-migration-plan.md)
+and [`docs/prd-traceability.md`](docs/prd-traceability.md).

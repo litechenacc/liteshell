@@ -1,0 +1,9 @@
+[package]
+name = "liteshell-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liteshell-builtins = { path = "../liteshell-builtins" }
+thiserror.workspace = true

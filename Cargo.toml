@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/liteshell",
+  "crates/liteshell-core",
+  "crates/liteshell-builtins",
+  "crates/liteshell-tui",
+  "crates/liteshell-windows",
+  "crates/liteshell-fff",
+  "xtask",
+]
+resolver = "2"
+default-members = ["crates/liteshell"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+
+[workspace.dependencies]
+crossterm = "=0.28.1"
+libloading = "=0.8.6"
+ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }
+thiserror = "=2.0.11"
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"

@@ -1,0 +1,8 @@
+[package]
+name = "liteshell-builtins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liteshell-core = { path = "../liteshell-core" }

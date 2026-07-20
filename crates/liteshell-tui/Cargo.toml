@@ -1,0 +1,11 @@
+[package]
+name = "liteshell-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+liteshell-core = { path = "../liteshell-core" }
+ratatui.workspace = true
+unicode-width.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "liteshell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+liteshell-builtins = { path = "../liteshell-builtins" }
+liteshell-core = { path = "../liteshell-core" }
+liteshell-fff = { path = "../liteshell-fff" }
+liteshell-tui = { path = "../liteshell-tui" }
+liteshell-windows = { path = "../liteshell-windows" }
+
+[dev-dependencies]
+tempfile = "=3.15.0"
