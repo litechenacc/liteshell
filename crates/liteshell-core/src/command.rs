@@ -24,6 +24,24 @@ pub trait SearchProvider {
         root: &Path,
         limit: usize,
     ) -> Result<Vec<SearchCandidate>, String>;
+
+    fn search_stream(
+        &mut self,
+        kind: SearchKind,
+        query: &str,
+        root: &Path,
+        limit: usize,
+        emit: &mut dyn FnMut(SearchCandidate),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        for candidate in self.search(kind, query, root, limit)? {
+            if cancelled() {
+                break;
+            }
+            emit(candidate);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

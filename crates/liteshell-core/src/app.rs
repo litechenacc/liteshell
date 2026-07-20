@@ -6,6 +6,7 @@ pub enum AppMode {
     Editing,
     Completion,
     Pager,
+    RunningTask,
     RunningChild,
     Exiting,
 }

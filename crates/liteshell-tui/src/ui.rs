@@ -44,7 +44,8 @@ fn draw_transcript(
 ) -> Option<u16> {
     let history: Vec<_> = state.output.lines().collect();
     let history_len = history.len();
-    let total = history_len + 2;
+    let show_prompt = state.mode != AppMode::RunningTask;
+    let total = history_len + if show_prompt { 2 } else { 0 };
     let available = area.height as usize;
     let end = total.saturating_sub(state.output.offset.min(total.saturating_sub(1)));
     let start = end.saturating_sub(available);
@@ -70,7 +71,7 @@ fn draw_transcript(
         items.push(item);
     }
 
-    if start <= history_len && history_len < end {
+    if show_prompt && start <= history_len && history_len < end {
         items.push(ListItem::new(Line::from(Span::styled(
             directory.to_owned(),
             Style::default()
@@ -78,7 +79,7 @@ fn draw_transcript(
                 .add_modifier(Modifier::BOLD),
         ))));
     }
-    if start <= history_len + 1 && history_len + 1 < end {
+    if show_prompt && start <= history_len + 1 && history_len + 1 < end {
         prompt_row = Some(area.y + items.len() as u16);
         items.push(ListItem::new(Line::from(vec![
             Span::styled(
@@ -111,15 +112,20 @@ fn draw_statusline(
     area: Rect,
 ) {
     let completion_active = state.mode == AppMode::Completion;
-    let mode = if completion_active {
+    let running = state.mode == AppMode::RunningTask;
+    let mode = if running {
+        " RUN "
+    } else if completion_active {
         " COMPLETE "
     } else {
         " EDIT "
     };
-    let mode_style = if !completion_active {
-        Style::default().fg(Color::Black).bg(Color::Green)
-    } else {
+    let mode_style = if running {
+        Style::default().fg(Color::Black).bg(Color::Yellow)
+    } else if completion_active {
         Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Green)
     }
     .add_modifier(Modifier::BOLD);
     let status_style = if last_status == 0 {

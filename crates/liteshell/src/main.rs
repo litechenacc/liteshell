@@ -5,7 +5,7 @@ use liteshell_builtins::{dispatch, Context, NAMES};
 use liteshell_core::{
     config::{history_path, Config},
     history::History,
-    parser, AppMode, OutputEvent, OutputSink, ShellState,
+    parser, AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider, ShellState,
 };
 use liteshell_fff::FffSearch;
 use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
@@ -13,7 +13,29 @@ use liteshell_windows::{launch, resolve, WindowsCommandResolver};
 use std::{
     io::{self, BufRead, IsTerminal, Write},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
+
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+enum SearchTaskEvent {
+    Candidate(SearchCandidate),
+    Error(String),
+    Finished { status: i32 },
+}
+
+struct RunningSearch {
+    command: String,
+    receiver: Receiver<SearchTaskEvent>,
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+    results: usize,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -114,14 +136,53 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
     let resolver = WindowsCommandResolver;
     let mut state = TuiState::new(config.scrollback_lines, config.scrollback_bytes);
     let mut terminal = TerminalSession::enter()?;
+    let mut running_search: Option<RunningSearch> = None;
 
     while shell.running {
+        update_running_search(
+            &mut running_search,
+            &mut state,
+            &mut shell.last_status,
+        );
+        if let Some(task) = running_search.as_ref() {
+            let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
+            state.status = format!(
+                "{} {} {}… {} result{}",
+                SPINNER[frame],
+                if task.cancelled.load(Ordering::Relaxed) {
+                    "cancelling"
+                } else {
+                    "running"
+                },
+                task.command,
+                task.results,
+                if task.results == 1 { "" } else { "s" }
+            );
+        }
+
         terminal
             .terminal()
             .draw(|frame| draw(frame, &state, &shell.prompt(), shell.last_status))?;
 
+        let wait = if running_search.is_some() {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(60)
+        };
+        if !event::poll(wait)? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(task) = running_search.as_ref() {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        task.cancelled.store(true, Ordering::Relaxed);
+                        state.status = format!("cancelling {}…", task.command);
+                    }
+                    continue;
+                }
                 if state.mode == AppMode::Pager {
                     handle_pager_key(&mut state, key);
                     continue;
@@ -291,6 +352,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                                 &resolver,
                                 &mut state,
                                 &mut terminal,
+                                &mut running_search,
                             )?;
                         }
                     }
@@ -319,6 +381,7 @@ fn execute_interactive(
     resolver: &WindowsCommandResolver,
     state: &mut TuiState,
     terminal: &mut TerminalSession,
+    running_search: &mut Option<RunningSearch>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     state
         .output
@@ -331,6 +394,24 @@ fn execute_interactive(
             return Ok(());
         }
     };
+
+    if matches!(arguments[0].to_ascii_lowercase().as_str(), "find" | "rg") {
+        if arguments[0].eq_ignore_ascii_case("rg") && arguments.len() < 2 {
+            state
+                .output
+                .push_text("rg: expected a search query\n", true);
+            shell.last_status = 2;
+            state.output.push_divider();
+            return Ok(());
+        }
+        *running_search = Some(start_search(
+            arguments[0].to_ascii_lowercase(),
+            arguments[1..].join(" "),
+            shell.cwd.clone(),
+        ));
+        state.mode = AppMode::RunningTask;
+        return Ok(());
+    }
 
     let mut events = EventBuffer::default();
     let result = {
@@ -367,6 +448,106 @@ fn execute_interactive(
     }
     state.output.push_divider();
     Ok(())
+}
+
+fn start_search(command: String, query: String, cwd: PathBuf) -> RunningSearch {
+    let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_command = command.clone();
+    std::thread::spawn(move || {
+        let mut search = FffSearch::default();
+        let kind = if worker_command == "rg" {
+            SearchKind::Grep
+        } else {
+            SearchKind::Files
+        };
+        let mut emit = |candidate| {
+            let _ = sender.send(SearchTaskEvent::Candidate(candidate));
+        };
+        let result = search.search_stream(
+            kind,
+            &query,
+            &cwd,
+            100,
+            &mut emit,
+            &|| worker_cancelled.load(Ordering::Relaxed),
+        );
+        let status = if worker_cancelled.load(Ordering::Relaxed) {
+            130
+        } else if let Err(error) = result {
+            let _ = sender.send(SearchTaskEvent::Error(format!(
+                "{worker_command}: {error}\n"
+            )));
+            1
+        } else {
+            0
+        };
+        let _ = sender.send(SearchTaskEvent::Finished { status });
+    });
+    RunningSearch {
+        command,
+        receiver,
+        cancelled,
+        started: Instant::now(),
+        results: 0,
+    }
+}
+
+fn update_running_search(
+    running: &mut Option<RunningSearch>,
+    state: &mut TuiState,
+    last_status: &mut i32,
+) {
+    let mut finished = None;
+    if let Some(task) = running.as_mut() {
+        loop {
+            match task.receiver.try_recv() {
+                Ok(SearchTaskEvent::Candidate(candidate)) => {
+                    task.results += 1;
+                    let text = if task.command == "rg" {
+                        format!("{}: {}\n", candidate.label, candidate.detail)
+                    } else {
+                        format!("{}\n", candidate.label)
+                    };
+                    state.output.push_text(&text, false);
+                }
+                Ok(SearchTaskEvent::Error(error)) => state.output.push_text(&error, true),
+                Ok(SearchTaskEvent::Finished { status }) => {
+                    finished = Some(status);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    state
+                        .output
+                        .push_text("search worker stopped unexpectedly\n", true);
+                    finished = Some(1);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(status) = finished {
+        let task = running.take().expect("running search");
+        let elapsed = task.started.elapsed();
+        *last_status = status;
+        state.mode = AppMode::Editing;
+        let outcome = match status {
+            0 => "finished",
+            130 => "cancelled",
+            _ => "failed",
+        };
+        state.status = format!(
+            "{} {} · {} results · {:.1}s",
+            task.command,
+            outcome,
+            task.results,
+            elapsed.as_secs_f32()
+        );
+        state.output.push_divider();
+    }
 }
 
 fn complete(shell: &ShellState, state: &mut TuiState) {

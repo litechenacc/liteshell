@@ -31,20 +31,34 @@ impl SearchProvider for FffSearch {
         root: &Path,
         limit: usize,
     ) -> Result<Vec<SearchCandidate>, String> {
-        self.ensure(root);
-        fallback(kind, query, root, limit)
+        let mut out = Vec::new();
+        self.search_stream(
+            kind,
+            query,
+            root,
+            limit,
+            &mut |candidate| out.push(candidate),
+            &|| false,
+        )?;
+        Ok(out)
     }
-}
-fn fallback(
-    kind: SearchKind,
-    query: &str,
-    root: &Path,
-    limit: usize,
-) -> Result<Vec<SearchCandidate>, String> {
-    let mut out = Vec::new();
-    let q = query.to_lowercase();
-    walk(root, root, kind, &q, limit, &mut out)?;
-    Ok(out)
+
+    fn search_stream(
+        &mut self,
+        kind: SearchKind,
+        query: &str,
+        root: &Path,
+        limit: usize,
+        emit: &mut dyn FnMut(SearchCandidate),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        self.ensure(root);
+        let query = query.to_lowercase();
+        let mut count = 0;
+        walk(
+            root, root, kind, &query, limit, &mut count, emit, cancelled,
+        )
+    }
 }
 fn walk(
     root: &Path,
@@ -52,9 +66,11 @@ fn walk(
     kind: SearchKind,
     q: &str,
     limit: usize,
-    out: &mut Vec<SearchCandidate>,
+    count: &mut usize,
+    emit: &mut dyn FnMut(SearchCandidate),
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
-    if out.len() >= limit {
+    if *count >= limit || cancelled() {
         return Ok(());
     }
     let entries = match fs::read_dir(dir) {
@@ -62,7 +78,7 @@ fn walk(
         Err(_) => return Ok(()),
     };
     for e in entries.flatten() {
-        if out.len() >= limit {
+        if *count >= limit || cancelled() {
             break;
         }
         let p = e.path();
@@ -76,20 +92,21 @@ fn walk(
             if matches!(kind, SearchKind::Directories | SearchKind::Mixed)
                 && rel.to_lowercase().contains(q)
             {
-                out.push(SearchCandidate {
+                emit(SearchCandidate {
                     label: rel.clone(),
                     detail: "directory".into(),
                     value: format!("{rel}\\"),
                     directory: true,
                 });
+                *count += 1;
             }
             if !matches!(e.file_name().to_str(), Some(".git" | "target" | "build")) {
-                walk(root, &p, kind, q, limit, out)?;
+                walk(root, &p, kind, q, limit, count, emit, cancelled)?;
             }
         } else if matches!(kind, SearchKind::Files | SearchKind::Mixed)
             && rel.to_lowercase().contains(q)
         {
-            out.push(SearchCandidate {
+            emit(SearchCandidate {
                 label: rel.clone(),
                 detail: e
                     .metadata()
@@ -98,18 +115,23 @@ fn walk(
                 value: rel,
                 directory: false,
             });
+            *count += 1;
         } else if kind == SearchKind::Grep && !q.is_empty() {
             if let Ok(file) = fs::File::open(&p) {
                 for (number, line) in BufReader::new(file).lines().take(100_000).enumerate() {
                     let Ok(line) = line else { break };
+                    if cancelled() {
+                        break;
+                    }
                     if line.to_lowercase().contains(q) {
-                        out.push(SearchCandidate {
+                        emit(SearchCandidate {
                             label: format!("{rel}:{}:1", number + 1),
                             detail: line,
                             value: rel.clone(),
                             directory: false,
                         });
-                        if out.len() >= limit {
+                        *count += 1;
+                        if *count >= limit {
                             break;
                         }
                     }
