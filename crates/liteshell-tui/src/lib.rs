@@ -21,6 +21,7 @@ impl OutputSink for EventBuffer {
 pub enum CompletionSource {
     #[default]
     Path,
+    DeepPath,
     History,
 }
 

@@ -3,7 +3,8 @@ use crossterm::event::{
 };
 use liteshell_builtins::{dispatch, Context, NAMES};
 use liteshell_core::{
-    config::{history_path, load_startup_environment, Config},
+    config::{directory_db_path, history_path, load_startup_environment, Config},
+    directory_db::{frecency, now_epoch, DirectoryDb},
     history::History,
     parser, AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider,
     ShellState,
@@ -25,6 +26,7 @@ use std::{
 };
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const DIRECTORY_DB_FLUSH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 enum SearchTaskEvent {
     Candidate(SearchCandidate),
@@ -53,10 +55,22 @@ struct RunningExternal {
     started: Instant,
 }
 
+enum DeepCompletionEvent {
+    Finished(Result<Vec<SearchCandidate>, String>),
+}
+
+struct RunningDeepCompletion {
+    token: String,
+    receiver: Receiver<DeepCompletionEvent>,
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+}
+
 #[derive(Default)]
 struct RunningTasks {
     search: Option<RunningSearch>,
     external: Option<RunningExternal>,
+    deep_completion: Option<RunningDeepCompletion>,
 }
 
 fn main() {
@@ -107,12 +121,15 @@ impl OutputSink for PlainOutput {
 }
 
 fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
-    let mut search = FffSearch::default();
     let resolver = WindowsCommandResolver;
     let mut output = PlainOutput;
     let config = Config::default();
+    let mut search = FffSearch::new(config.deep_search_exclude_dirs.clone());
     let mut history = History::new(history_path(), config.history_capacity);
     let _ = history.load();
+    let mut directory_db = DirectoryDb::new(directory_db_path());
+    let _ = directory_db.load();
+    directory_db.record(&shell.cwd);
 
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -128,6 +145,7 @@ fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         history.add(&line);
+        let previous_cwd = shell.cwd.clone();
         let result = {
             let mut context = Context {
                 shell: &mut shell,
@@ -151,12 +169,17 @@ fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
             127
         };
         shell.last_status = status;
+        if result.handled && result.status == 0 && shell.cwd != previous_cwd {
+            directory_db.record(&shell.cwd);
+        }
+        let _ = directory_db.flush_if_due(DIRECTORY_DB_FLUSH_INTERVAL);
         if !shell.running {
             break;
         }
     }
 
     let _ = history.save();
+    directory_db.flush()?;
     Ok(())
 }
 
@@ -166,15 +189,20 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
     let _ = history.load();
     let mut history_index = history.entries().len();
     let mut history_scratch = String::new();
-    let mut search = FffSearch::default();
+    let mut search = FffSearch::new(config.deep_search_exclude_dirs.clone());
+    let mut directory_db = DirectoryDb::new(directory_db_path());
+    let _ = directory_db.load();
+    directory_db.record(&shell.cwd);
     let resolver = WindowsCommandResolver;
     let mut state = TuiState::new(config.scrollback_lines, config.scrollback_bytes);
     let mut terminal = TerminalSession::enter()?;
     let mut running = RunningTasks::default();
 
     while shell.running {
+        let _ = directory_db.flush_if_due(DIRECTORY_DB_FLUSH_INTERVAL);
         update_running_search(&mut running.search, &mut state, &mut shell.last_status);
         update_running_external(&mut running.external, &mut state, &mut shell.last_status);
+        update_deep_completion(&mut running.deep_completion, &mut state);
         if let Some(task) = running.search.as_ref() {
             let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
             state.status = format!(
@@ -201,13 +229,19 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                 },
                 task.command,
             );
+        } else if let Some(task) = running.deep_completion.as_ref() {
+            let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
+            state.status = format!("{} searching directories…", SPINNER[frame]);
         }
 
         terminal
             .terminal()
             .draw(|frame| draw(frame, &state, &shell.prompt(), shell.last_status))?;
 
-        let wait = if running.search.is_some() || running.external.is_some() {
+        let wait = if running.search.is_some()
+            || running.external.is_some()
+            || running.deep_completion.is_some()
+        {
             Duration::from_millis(80)
         } else {
             Duration::from_secs(60)
@@ -242,6 +276,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
 
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        cancel_deep_completion(&mut running.deep_completion);
                         if !state.editor.text.is_empty() {
                             state.output.push_text(
                                 &format!("{}{}^C\n", shell.prompt(), state.editor.text),
@@ -276,7 +311,13 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             let completion_was_open = state.mode == AppMode::Completion;
                             state.editor.insert(character);
                             if completion_was_open || should_open_path_completion(&state) {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         }
                     }
@@ -290,7 +331,13 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             let completion_was_open = state.mode == AppMode::Completion;
                             state.editor.backspace();
                             if completion_was_open {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         }
                     }
@@ -301,7 +348,13 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             let completion_was_open = state.mode == AppMode::Completion;
                             state.editor.delete();
                             if completion_was_open {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         }
                     }
@@ -312,7 +365,13 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             let completion_was_open = state.mode == AppMode::Completion;
                             state.editor.left();
                             if completion_was_open {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         }
                     }
@@ -323,7 +382,13 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             let completion_was_open = state.mode == AppMode::Completion;
                             state.editor.right();
                             if completion_was_open {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         }
                     }
@@ -365,13 +430,20 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             if state.completion_source == CompletionSource::History {
                                 refresh_history_completion(history.entries(), &mut state);
                             } else {
-                                complete(&shell, &mut state);
+                                complete_with_sources(
+                                    &shell,
+                                    &mut state,
+                                    Some(&directory_db),
+                                    &mut running.deep_completion,
+                                    &config.deep_search_exclude_dirs,
+                                );
                             }
                         } else {
                             accept_completion(&shell, &mut state);
                         }
                     }
                     KeyCode::Esc => {
+                        cancel_deep_completion(&mut running.deep_completion);
                         state.completion.clear();
                         state.completion_query.clear();
                         state.completion_source = CompletionSource::Path;
@@ -383,6 +455,17 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                             && state.completion.is_empty()
                         {
                             state.status = "no matching history".into();
+                            continue;
+                        }
+                        if state.mode == AppMode::Completion
+                            && state.completion_source == CompletionSource::DeepPath
+                            && state.completion.is_empty()
+                        {
+                            state.status = if running.deep_completion.is_some() {
+                                "recursive search is still running".into()
+                            } else {
+                                "no matching directories".into()
+                            };
                             continue;
                         }
                         if !state.completion.is_empty() {
@@ -397,6 +480,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                         if !line.trim().is_empty() {
                             history.add(&line);
                             history_index = history.entries().len();
+                            let previous_cwd = shell.cwd.clone();
                             execute_interactive(
                                 &line,
                                 &mut shell,
@@ -406,6 +490,9 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                                 &mut terminal,
                                 &mut running,
                             )?;
+                            if shell.cwd != previous_cwd {
+                                directory_db.record(&shell.cwd);
+                            }
                         }
                     }
                     KeyCode::PageUp => state.output.scroll_up(10),
@@ -423,6 +510,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let _ = history.save();
+    directory_db.flush()?;
     Ok(())
 }
 
@@ -460,6 +548,7 @@ fn execute_interactive(
             arguments[0].to_ascii_lowercase(),
             arguments[1..].join(" "),
             shell.cwd.clone(),
+            search.excluded_directories().map(str::to_owned).collect(),
         ));
         state.mode = AppMode::RunningTask;
         return Ok(());
@@ -696,13 +785,18 @@ fn update_running_external(
     }
 }
 
-fn start_search(command: String, query: String, cwd: PathBuf) -> RunningSearch {
+fn start_search(
+    command: String,
+    query: String,
+    cwd: PathBuf,
+    excluded_directories: Vec<String>,
+) -> RunningSearch {
     let (sender, receiver) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_command = command.clone();
     std::thread::spawn(move || {
-        let mut search = FffSearch::default();
+        let mut search = FffSearch::new(excluded_directories);
         let kind = if worker_command == "rg" {
             SearchKind::Grep
         } else {
@@ -791,7 +885,132 @@ fn update_running_search(
     }
 }
 
+fn start_deep_completion(
+    token: String,
+    root: PathBuf,
+    query: String,
+    excluded_directories: Vec<String>,
+) -> RunningDeepCompletion {
+    let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    std::thread::spawn(move || {
+        let mut search = FffSearch::new(excluded_directories);
+        let mut candidates: Vec<(i32, SearchCandidate)> = Vec::new();
+        let result = search.search_stream(
+            SearchKind::Directories,
+            &query,
+            &root,
+            usize::MAX,
+            &mut |mut candidate| {
+                let score = fuzzy_score(&candidate.label, &query).unwrap_or_default();
+                let relative = candidate.value.trim_end_matches(['\\', '/']);
+                let mut value = display_completion_path(&root.join(relative));
+                value.push('\\');
+                candidate.label = value.clone();
+                candidate.value = value;
+                candidates.push((score, candidate));
+                if candidates.len() > 512 {
+                    candidates.sort_by(|left, right| {
+                        right.0.cmp(&left.0).then_with(|| {
+                            left.1
+                                .label
+                                .to_lowercase()
+                                .cmp(&right.1.label.to_lowercase())
+                        })
+                    });
+                    candidates.truncate(256);
+                }
+            },
+            &|| worker_cancelled.load(Ordering::Relaxed),
+        );
+        let outcome = result.map(|()| {
+            candidates.sort_by(|left, right| {
+                right.0.cmp(&left.0).then_with(|| {
+                    left.1
+                        .label
+                        .to_lowercase()
+                        .cmp(&right.1.label.to_lowercase())
+                })
+            });
+            candidates.truncate(256);
+            candidates
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect()
+        });
+        if !worker_cancelled.load(Ordering::Relaxed) {
+            let _ = sender.send(DeepCompletionEvent::Finished(outcome));
+        }
+    });
+    RunningDeepCompletion {
+        token,
+        receiver,
+        cancelled,
+        started: Instant::now(),
+    }
+}
+
+fn update_deep_completion(running: &mut Option<RunningDeepCompletion>, state: &mut TuiState) {
+    let event = running
+        .as_ref()
+        .and_then(|task| task.receiver.try_recv().ok());
+    let Some(DeepCompletionEvent::Finished(result)) = event else {
+        return;
+    };
+    let task = running.take().expect("running deep completion");
+    if state.completion_source != CompletionSource::DeepPath
+        || current_completion_token(state) != task.token
+    {
+        return;
+    }
+    match result {
+        Ok(candidates) => {
+            state.completion = candidates
+                .into_iter()
+                .map(|candidate| (candidate.value, "recursive directory".to_owned()))
+                .collect();
+            state.selected = 0;
+            state.status = if state.completion.is_empty() {
+                "no matching directories".into()
+            } else {
+                format!("{} recursive matches", state.completion.len())
+            };
+        }
+        Err(error) => {
+            state.completion.clear();
+            state.status = format!("recursive search failed: {error}");
+        }
+    }
+}
+
+fn cancel_deep_completion(running: &mut Option<RunningDeepCompletion>) {
+    if let Some(task) = running.take() {
+        task.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn current_completion_token(state: &TuiState) -> String {
+    let before_cursor = &state.editor.text[..state.editor.cursor];
+    let token_start = before_cursor
+        .rfind(char::is_whitespace)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    before_cursor[token_start..].to_owned()
+}
+
 fn complete(shell: &ShellState, state: &mut TuiState) {
+    let mut deep_completion = None;
+    complete_with_sources(shell, state, None, &mut deep_completion, &[]);
+}
+
+fn complete_with_sources(
+    shell: &ShellState,
+    state: &mut TuiState,
+    directory_db: Option<&DirectoryDb>,
+    deep_completion: &mut Option<RunningDeepCompletion>,
+    excluded_directories: &[String],
+) {
     state.mode = AppMode::Completion;
     state.completion_source = CompletionSource::Path;
     state.completion_query.clear();
@@ -800,7 +1019,7 @@ fn complete(shell: &ShellState, state: &mut TuiState) {
         .rfind(char::is_whitespace)
         .map(|index| index + 1)
         .unwrap_or(0);
-    let token = &before_cursor[token_start..];
+    let token = before_cursor[token_start..].to_owned();
     let command = before_cursor
         .split_whitespace()
         .next()
@@ -808,24 +1027,45 @@ fn complete(shell: &ShellState, state: &mut TuiState) {
         .to_ascii_lowercase();
     let directories_only = command == "cd";
     let accepts_current_directory = matches!(command.as_str(), "cd" | "ls");
-    let mut values: Vec<(i32, String, String)> = Vec::new();
+    if directories_only && token.contains('*') {
+        state.completion_source = CompletionSource::DeepPath;
+        state.completion.clear();
+        state.selected = 0;
+        if deep_completion.as_ref().map(|task| task.token.as_str()) != Some(token.as_str()) {
+            cancel_deep_completion(deep_completion);
+            let (root, query) = deep_search_request(shell, &token);
+            *deep_completion = Some(start_deep_completion(
+                token,
+                root,
+                query,
+                excluded_directories.to_vec(),
+            ));
+        }
+        state.status = "searching directories…".into();
+        return;
+    }
+    cancel_deep_completion(deep_completion);
+    let mut values: Vec<(i64, String, String)> = Vec::new();
 
     if token_start == 0 {
         values.extend(NAMES.iter().filter_map(|name| {
-            fuzzy_score(name, token).map(|score| (score, (*name).to_owned(), "builtin".to_owned()))
+            fuzzy_score(name, &token)
+                .map(|score| (score as i64, (*name).to_owned(), "builtin".to_owned()))
         }));
     } else {
-        let expandable_root = matches!(token, "~" | "." | "..")
-            || environment_prefix(token).is_some_and(|(_, consumed)| consumed == token.len());
+        let expandable_root = matches!(token.as_str(), "~" | "." | "..")
+            || environment_prefix(&token).is_some_and(|(_, consumed)| consumed == token.len());
         let separator = token.rfind(['\\', '/']);
         let (directory_part, query, explicit_current) = if expandable_root {
             (format!("{token}\\"), "", Some(token.to_owned()))
         } else {
             match separator {
                 Some(index) => (token[..=index].to_owned(), &token[index + 1..], None),
-                None => (String::new(), token, None),
+                None => (String::new(), token.as_str(), None),
             }
         };
+        #[cfg(windows)]
+        let directory_part = directory_part.replace('/', "\\");
         let directory = expand_completion_directory(shell, &directory_part);
 
         if accepts_current_directory && query.is_empty() {
@@ -836,10 +1076,11 @@ fn complete(shell: &ShellState, state: &mut TuiState) {
                     current_directory_candidate(&directory_part)
                 }
             });
-            values.push((i32::MAX, current, "current directory".to_owned()));
+            values.push((i64::MAX, current, "current directory".to_owned()));
         }
 
-        if let Ok(entries) = std::fs::read_dir(directory) {
+        let mut local_paths = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&directory) {
             for entry in entries.flatten() {
                 let is_directory = entry.path().is_dir();
                 if directories_only && !is_directory {
@@ -856,7 +1097,38 @@ fn complete(shell: &ShellState, state: &mut TuiState) {
                 } else {
                     "file"
                 };
-                values.push((score, value, detail.to_owned()));
+                local_paths.insert(entry.path().to_string_lossy().to_lowercase());
+                values.push((2_000_000 + score as i64, value, detail.to_owned()));
+            }
+        }
+
+        if directories_only && !query.is_empty() {
+            if let Some(directory_db) = directory_db {
+                let now = now_epoch();
+                for entry in directory_db.entries() {
+                    let key = entry.path.to_string_lossy().to_lowercase();
+                    if key == shell.cwd.to_string_lossy().to_lowercase()
+                        || local_paths.contains(&key)
+                    {
+                        continue;
+                    }
+                    let basename = entry
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let (class, score) = if let Some(score) = fuzzy_score(basename, query) {
+                        (1_000_000_i64, score)
+                    } else if let Some(score) = fuzzy_score(&key, query) {
+                        (500_000_i64, score)
+                    } else {
+                        continue;
+                    };
+                    let mut value = display_completion_path(&entry.path);
+                    value.push('\\');
+                    let rank = frecency(entry, now).min(10_000.0) as i64;
+                    values.push((class + score as i64 * 100 + rank, value, "visited".into()));
+                }
             }
         }
     }
@@ -872,6 +1144,31 @@ fn complete(shell: &ShellState, state: &mut TuiState) {
         .map(|(_, value, detail)| (value, detail))
         .collect();
     state.selected = 0;
+}
+
+fn display_completion_path(path: &Path) -> String {
+    let displayed = path.to_string_lossy();
+    displayed
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| displayed.strip_prefix(r"\\?\").map(str::to_owned))
+        .unwrap_or_else(|| displayed.into_owned())
+}
+
+fn deep_search_request(shell: &ShellState, token: &str) -> (PathBuf, String) {
+    let star = token.find('*').expect("deep search token");
+    let before = &token[..star];
+    let after = &token[star + 1..];
+    let separator = before.rfind(['\\', '/']);
+    let (root_text, query_prefix) = match separator {
+        Some(index) => (&before[..=index], &before[index + 1..]),
+        None => ("", before),
+    };
+    let root = expand_completion_directory(shell, root_text);
+    let query = format!("{query_prefix}{after}")
+        .trim_matches(['\\', '/'])
+        .to_owned();
+    (root, query)
 }
 
 fn expand_completion_directory(shell: &ShellState, raw: &str) -> PathBuf {
@@ -1185,6 +1482,41 @@ mod tests {
             Path::new(r"C:\tools\just.exe"),
             &["just".to_owned(), "release".to_owned()]
         ));
+    }
+
+    #[test]
+    fn visited_directories_are_added_to_cd_completion_below_local_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("liteshell-local");
+        let visited = root.path().join("works").join("liteshell-visited");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&visited).unwrap();
+        let shell = ShellState::new(root.path().to_owned());
+        let mut db = DirectoryDb::new(root.path().join("directories.db"));
+        db.record(&visited);
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("cd lite".to_owned());
+        let mut deep = None;
+
+        complete_with_sources(&shell, &mut state, Some(&db), &mut deep, &[]);
+
+        assert!(state.completion[0].0.starts_with("liteshell-local"));
+        assert!(state
+            .completion
+            .iter()
+            .any(|(value, detail)| value.contains("liteshell-visited") && detail == "visited"));
+    }
+
+    #[test]
+    fn star_splits_recursive_root_from_fuzzy_query() {
+        let shell = ShellState::new(PathBuf::from(r"C:\home"));
+        let (root, query) = deep_search_request(&shell, r"works\*lite");
+        assert_eq!(root, PathBuf::from(r"C:\home\works"));
+        assert_eq!(query, "lite");
+
+        let (root, query) = deep_search_request(&shell, "lite*");
+        assert_eq!(root, shell.cwd);
+        assert_eq!(query, "lite");
     }
 
     #[test]

@@ -257,6 +257,7 @@ fn draw_completion_popup(
     };
     let title = match state.completion_source {
         CompletionSource::Path => format!("{position} fuzzy search{overflow}"),
+        CompletionSource::DeepPath => format!("{position} recursive search{overflow}"),
         CompletionSource::History => {
             format!("{position} history: {}{overflow}", state.completion_query)
         }

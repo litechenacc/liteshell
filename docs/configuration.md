@@ -10,6 +10,10 @@ LiteShell's static defaults are in `crates/liteshell-core/src/config.rs`.
 History is stored as UTF-8 at `%LOCALAPPDATA%\LiteShell\history`. The prompt uses
 the shell-owned working directory and is produced by `ShellState::prompt`.
 
+Visited directories are stored at `%LOCALAPPDATA%\LiteShell\directories.db` and
+ranked by frequency and recency for `cd` completion. The in-memory database is
+appended to disk every five minutes while dirty and is flushed on exit.
+
 At startup LiteShell loads environment assignments from `~/.liteshellrc`, when
 the file exists. `~` uses `HOME` first and falls back to `USERPROFILE`. Supported
 forms are `NAME=value`, `export NAME=value`, and `set NAME=value`. Values can
@@ -19,3 +23,16 @@ are expanded.
 
 The file is deliberately data-only. LiteShell does not execute startup commands,
 profiles, or plugins from it.
+
+`LITESHELL_DEEP_SEARCH_EXCLUDE_DIRS` controls directory basenames pruned from
+recursive `cd *query` searches. Values are separated by semicolons and matching
+is case-insensitive on Windows. The default is:
+
+```text
+LITESHELL_DEEP_SEARCH_EXCLUDE_DIRS=.git;node_modules;__pycache__
+```
+
+Setting it to an empty value disables pruning. This setting affects recursive
+filesystem traversal (`cd *query`, `find`, and `rg`); direct completion,
+explicit paths, and the visited-directory database remain available for
+excluded directories.

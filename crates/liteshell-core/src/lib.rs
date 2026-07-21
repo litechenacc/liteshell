@@ -2,6 +2,7 @@ pub mod app;
 pub mod command;
 pub mod completion;
 pub mod config;
+pub mod directory_db;
 pub mod editor;
 pub mod history;
 pub mod output;

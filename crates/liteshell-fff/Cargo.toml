@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 libloading.workspace = true
 liteshell-core = { path = "../liteshell-core" }
+
+[dev-dependencies]
+tempfile = "=3.15.0"

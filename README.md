@@ -51,6 +51,10 @@ flow. The two-line prompt follows Starship's default style, completion opens as 
 fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
 statusline occupies the bottom row. Page Up/Down and the mouse wheel navigate the
 transcript.
+`cd` completion combines immediate child directories with a frequency-and-recency
+ranked database of previously visited directories. Include `*` in the path token
+to explicitly request a cancellable recursive directory search, for example
+`cd ~\*lite`; every destination remains visible and user-selected in the popup.
 `less` supports arrows, `j`/`k`, pages, `g`/`G`, and `q`. Output from external
 batch commands such as `just`, `cargo`, and `git` streams into LiteShell's
 scrollback. Terminal applications such as `ssh`, `nvim`, and `codex` temporarily

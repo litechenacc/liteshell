@@ -7,6 +7,7 @@ pub struct Config {
     pub scrollback_lines: usize,
     pub scrollback_bytes: usize,
     pub default_tail_lines: usize,
+    pub deep_search_exclude_dirs: Vec<String>,
 }
 
 impl Default for Config {
@@ -16,6 +17,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             scrollback_bytes: 4 * 1024 * 1024,
             default_tail_lines: 10,
+            deep_search_exclude_dirs: deep_search_exclude_dirs(),
         }
     }
 }
@@ -30,6 +32,30 @@ pub fn history_path() -> PathBuf {
         })
         .join("LiteShell")
         .join("history")
+}
+
+pub fn directory_db_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+        .join("LiteShell")
+        .join("directories.db")
+}
+
+fn deep_search_exclude_dirs() -> Vec<String> {
+    match std::env::var("LITESHELL_DEEP_SEARCH_EXCLUDE_DIRS") {
+        Ok(value) => value,
+        Err(_) => ".git;node_modules;__pycache__".to_owned(),
+    }
+    .split(';')
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_owned)
+    .collect()
 }
 
 pub fn startup_path() -> PathBuf {

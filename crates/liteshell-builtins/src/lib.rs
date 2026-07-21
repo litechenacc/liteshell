@@ -209,7 +209,9 @@ fn cat(a: &[String], c: &mut Context<'_>) -> CommandResult {
     for p in &a[1..] {
         let path = c.shell.resolve(p);
         match read_text(&path) {
-            Ok(s) => c.output.emit(OutputEvent::Styled(highlight_text(&path, &s))),
+            Ok(s) => c
+                .output
+                .emit(OutputEvent::Styled(highlight_text(&path, &s))),
             Err(e) => {
                 status = 1;
                 let msg = if e == "binary" {

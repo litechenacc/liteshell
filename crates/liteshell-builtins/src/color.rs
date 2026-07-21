@@ -19,7 +19,10 @@ pub fn highlight_text(path: &Path, text: &str) -> StyledText {
     StyledText::new(spans)
 }
 
-pub fn highlight_lines<'a>(path: &Path, lines: impl IntoIterator<Item = &'a str>) -> Vec<StyledLine> {
+pub fn highlight_lines<'a>(
+    path: &Path,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Vec<StyledLine> {
     lines
         .into_iter()
         .map(|line| StyledLine {
@@ -170,14 +173,62 @@ fn starts_uppercase(value: &str) -> bool {
 fn is_keyword(value: &str) -> bool {
     matches!(
         value,
-        "as" | "async" | "await" | "break" | "case" | "catch" | "class" | "const"
-            | "continue" | "crate" | "def" | "do" | "else" | "enum" | "export"
-            | "extends" | "false" | "fn" | "for" | "from" | "function" | "if"
-            | "impl" | "import" | "in" | "interface" | "let" | "loop" | "match"
-            | "mod" | "move" | "mut" | "new" | "None" | "null" | "pub" | "raise"
-            | "ref" | "return" | "self" | "Self" | "Some" | "static" | "struct"
-            | "super" | "switch" | "throw" | "trait" | "true" | "try" | "type"
-            | "use" | "var" | "where" | "while" | "with" | "yield"
+        "as" | "async"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "crate"
+            | "def"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "fn"
+            | "for"
+            | "from"
+            | "function"
+            | "if"
+            | "impl"
+            | "import"
+            | "in"
+            | "interface"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "new"
+            | "None"
+            | "null"
+            | "pub"
+            | "raise"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "Some"
+            | "static"
+            | "struct"
+            | "super"
+            | "switch"
+            | "throw"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "use"
+            | "var"
+            | "where"
+            | "while"
+            | "with"
+            | "yield"
     )
 }
 
@@ -190,15 +241,27 @@ mod tests {
         let source = "fn main() { // hello\n  let n = 42;\n}\n";
         let styled = highlight_text(Path::new("main.rs"), source);
         assert_eq!(styled.text(), source);
-        assert!(styled.spans.iter().any(|item| item.style.foreground == Color::Keyword));
-        assert!(styled.spans.iter().any(|item| item.style.foreground == Color::Comment));
-        assert!(styled.spans.iter().any(|item| item.style.foreground == Color::Number));
+        assert!(styled
+            .spans
+            .iter()
+            .any(|item| item.style.foreground == Color::Keyword));
+        assert!(styled
+            .spans
+            .iter()
+            .any(|item| item.style.foreground == Color::Comment));
+        assert!(styled
+            .spans
+            .iter()
+            .any(|item| item.style.foreground == Color::Number));
     }
 
     #[test]
     fn files_are_classified_for_ls() {
         let directory = std::fs::metadata(std::env::current_dir().unwrap()).unwrap();
-        assert_eq!(file_color(Path::new("folder"), &directory), Color::Directory);
+        assert_eq!(
+            file_color(Path::new("folder"), &directory),
+            Color::Directory
+        );
 
         let file = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
         assert_eq!(file_color(Path::new("tool.exe"), &file), Color::Executable);
