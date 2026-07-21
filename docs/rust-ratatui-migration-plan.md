@@ -76,8 +76,12 @@ covered by acceptance testing.
 
 ### External foreground programs
 
-The first Rust release preserves direct console inheritance for `ssh`, `nvim`,
-`codex`, and other interactive programs:
+Batch-oriented programs such as `just`, `cargo`, and `git` run with piped
+standard output and error. LiteShell reads both streams concurrently and appends
+them to its internal scrollback while keeping the Ratatui interface active.
+
+LiteShell preserves direct console inheritance for `ssh`, `nvim`, `codex`, and
+other interactive programs:
 
 1. finish the current Ratatui frame;
 2. disable raw mode and mouse capture;
@@ -87,9 +91,9 @@ The first Rust release preserves direct console inheritance for `ssh`, `nvim`,
 6. restore the Ratatui terminal and redraw the complete application;
 7. append the child's exit status to shell scrollback.
 
-The child output is visible while the child owns the console, but is not captured
-into LiteShell's internal scrollback. Capturing and embedding child output requires
-ConPTY and a VT screen model and is a separate future project.
+The interactive child's output is visible while it owns the console, but is not
+captured into LiteShell's internal scrollback. Embedding interactive child output
+requires ConPTY and a VT screen model and remains a separate future project.
 
 Terminal suspension and restoration must be panic-safe. A child launch failure
 must also restore the Ratatui session before displaying the error.

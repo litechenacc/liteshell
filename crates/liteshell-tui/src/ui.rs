@@ -1,5 +1,5 @@
 use crate::{CompletionSource, TuiState};
-use liteshell_core::AppMode;
+use liteshell_core::{AppMode, SemanticColor, StyledLine, TextStyle};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,6 +10,42 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 const COMPLETION_ROWS: usize = 8;
+
+fn semantic_style(style: TextStyle) -> Style {
+    let foreground = match style.foreground {
+        SemanticColor::Default => Color::Reset,
+        SemanticColor::Directory => Color::LightBlue,
+        SemanticColor::Executable | SemanticColor::Added => Color::Green,
+        SemanticColor::Symlink | SemanticColor::Command => Color::Cyan,
+        SemanticColor::Metadata | SemanticColor::Comment => Color::DarkGray,
+        SemanticColor::Heading | SemanticColor::Keyword => Color::Magenta,
+        SemanticColor::Option | SemanticColor::String => Color::Yellow,
+        SemanticColor::Path => Color::White,
+        SemanticColor::Number => Color::LightCyan,
+        SemanticColor::Punctuation => Color::Gray,
+        SemanticColor::Removed => Color::Red,
+    };
+    let mut result = Style::default().fg(foreground);
+    if style.bold {
+        result = result.add_modifier(Modifier::BOLD);
+    }
+    if style.dim {
+        result = result.add_modifier(Modifier::DIM);
+    }
+    if style.italic {
+        result = result.add_modifier(Modifier::ITALIC);
+    }
+    result
+}
+
+fn styled_line(line: &StyledLine) -> Line<'static> {
+    Line::from(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.text.clone(), semantic_style(span.style)))
+            .collect::<Vec<_>>(),
+    )
+}
 
 pub fn draw(frame: &mut Frame, state: &TuiState, prompt: &str, last_status: i32) {
     if state.mode == AppMode::Pager {
@@ -61,12 +97,16 @@ fn draw_transcript(
     {
         let item = if entry.divider {
             ListItem::new(divider.clone()).style(Style::default().fg(Color::DarkGray))
+        } else if entry.error {
+            ListItem::new(entry.text.clone()).style(Style::default().fg(Color::Red))
         } else {
-            ListItem::new(entry.text.clone()).style(if entry.error {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default()
-            })
+            ListItem::new(Line::from(
+                entry
+                    .spans
+                    .iter()
+                    .map(|span| Span::styled(span.text.clone(), semantic_style(span.style)))
+                    .collect::<Vec<_>>(),
+            ))
         };
         items.push(item);
     }
@@ -267,9 +307,8 @@ fn draw_pager(frame: &mut Frame, state: &TuiState) {
         .iter()
         .skip(pager.top)
         .take(height)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(styled_line)
+        .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
     let status = Rect {
         x: area.x,
@@ -293,6 +332,12 @@ fn draw_pager(frame: &mut Frame, state: &TuiState) {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn semantic_palette_maps_directory_color() {
+        let style = semantic_style(TextStyle::foreground(SemanticColor::Directory));
+        assert_eq!(style.fg, Some(Color::LightBlue));
+    }
 
     #[test]
     fn narrow_frame_renders() {

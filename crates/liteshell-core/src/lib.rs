@@ -11,5 +11,7 @@ pub mod shell;
 pub use app::{AppMode, AppState};
 pub use command::{CommandResult, SearchCandidate, SearchKind, SearchProvider};
 pub use editor::Editor;
-pub use output::{OutputEvent, OutputSink};
+pub use output::{
+    OutputEvent, OutputSink, SemanticColor, StyledLine, StyledSpan, StyledText, TextStyle,
+};
 pub use shell::ShellState;

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, io, path::PathBuf};
+use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -29,4 +30,190 @@ pub fn history_path() -> PathBuf {
         })
         .join("LiteShell")
         .join("history")
+}
+
+pub fn startup_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".liteshellrc")
+}
+
+#[derive(Debug, Error)]
+pub enum StartupError {
+    #[error("cannot read {path}: {source}")]
+    Read { path: PathBuf, source: io::Error },
+    #[error("{path}:{line}: expected NAME=value")]
+    InvalidAssignment { path: PathBuf, line: usize },
+    #[error("{path}:{line}: invalid environment variable name '{name}'")]
+    InvalidName {
+        path: PathBuf,
+        line: usize,
+        name: String,
+    },
+}
+
+/// Load environment assignments from `~/.liteshellrc` before command
+/// resolution. The file is intentionally data-only: it does not execute shell
+/// commands. Values may reference earlier assignments or inherited variables
+/// using `%NAME%`, `$NAME`, or `${NAME}`.
+pub fn load_startup_environment() -> Result<Option<PathBuf>, StartupError> {
+    let path = startup_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StartupError::Read {
+                path: path.clone(),
+                source,
+            })
+        }
+    };
+
+    let mut environment: HashMap<String, String> = std::env::vars()
+        .map(|(name, value)| (name.to_ascii_uppercase(), value))
+        .collect();
+    let mut assignments = Vec::new();
+    for (index, source) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let mut line = source.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("export ") {
+            line = value.trim_start();
+        } else if let Some(value) = line.strip_prefix("set ") {
+            line = value.trim_start();
+        }
+        if line.starts_with('"') && line.ends_with('"') && line.len() >= 2 {
+            line = &line[1..line.len() - 1];
+        }
+        let Some((name, raw_value)) = line.split_once('=') else {
+            return Err(StartupError::InvalidAssignment {
+                path,
+                line: line_number,
+            });
+        };
+        let name = name.trim();
+        if !valid_environment_name(name) {
+            return Err(StartupError::InvalidName {
+                path,
+                line: line_number,
+                name: name.to_owned(),
+            });
+        }
+        let raw_value = raw_value.trim();
+        let (raw_value, expand) =
+            if raw_value.starts_with('\'') && raw_value.ends_with('\'') && raw_value.len() >= 2 {
+                (&raw_value[1..raw_value.len() - 1], false)
+            } else if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2
+            {
+                (&raw_value[1..raw_value.len() - 1], true)
+            } else {
+                (raw_value, true)
+            };
+        let value = if expand {
+            expand_variables(raw_value, |variable| {
+                environment
+                    .get(&variable.to_ascii_uppercase())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        } else {
+            raw_value.to_owned()
+        };
+        environment.insert(name.to_ascii_uppercase(), value.clone());
+        assignments.push((name.to_owned(), value));
+    }
+
+    for (name, value) in assignments {
+        std::env::set_var(name, value);
+    }
+    Ok(Some(path))
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn expand_variables(value: &str, mut lookup: impl FnMut(&str) -> String) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '%' {
+            if let Some(relative_end) = characters[index + 1..]
+                .iter()
+                .position(|character| *character == '%')
+            {
+                let end = index + 1 + relative_end;
+                if end > index + 1 {
+                    output.push_str(&lookup(
+                        &characters[index + 1..end].iter().collect::<String>(),
+                    ));
+                    index = end + 1;
+                    continue;
+                }
+            }
+        } else if characters[index] == '$' && index + 1 < characters.len() {
+            if characters[index + 1] == '{' {
+                if let Some(relative_end) = characters[index + 2..]
+                    .iter()
+                    .position(|character| *character == '}')
+                {
+                    let end = index + 2 + relative_end;
+                    output.push_str(&lookup(
+                        &characters[index + 2..end].iter().collect::<String>(),
+                    ));
+                    index = end + 1;
+                    continue;
+                }
+            } else if characters[index + 1] == '_' || characters[index + 1].is_ascii_alphabetic() {
+                let mut end = index + 2;
+                while end < characters.len()
+                    && (characters[end] == '_' || characters[end].is_ascii_alphanumeric())
+                {
+                    end += 1;
+                }
+                output.push_str(&lookup(
+                    &characters[index + 1..end].iter().collect::<String>(),
+                ));
+                index = end;
+                continue;
+            }
+        }
+        output.push(characters[index]);
+        index += 1;
+    }
+    output
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn startup_values_expand_windows_and_posix_variables() {
+        let result = expand_variables(r"%ROOT%\bin;$ROOT\tools;${ROOT}\lib", |name| {
+            if name == "ROOT" {
+                r"D:\home".to_owned()
+            } else {
+                String::new()
+            }
+        });
+        assert_eq!(result, r"D:\home\bin;D:\home\tools;D:\home\lib");
+    }
+
+    #[test]
+    fn startup_names_are_restricted_to_environment_identifiers() {
+        assert!(valid_environment_name("PATH"));
+        assert!(valid_environment_name("SDK_VERSION"));
+        assert!(!valid_environment_name("BAD-NAME"));
+        assert!(!valid_environment_name("1BAD"));
+    }
 }

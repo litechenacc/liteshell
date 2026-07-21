@@ -51,8 +51,10 @@ flow. The two-line prompt follows Starship's default style, completion opens as 
 fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
 statusline occupies the bottom row. Page Up/Down and the mouse wheel navigate the
 transcript.
-`less` supports arrows, `j`/`k`, pages, `g`/`G`, and `q`. Foreground applications
-temporarily own the console; LiteShell restores Ratatui when they exit.
+`less` supports arrows, `j`/`k`, pages, `g`/`G`, and `q`. Output from external
+batch commands such as `just`, `cargo`, and `git` streams into LiteShell's
+scrollback. Terminal applications such as `ssh`, `nvim`, and `codex` temporarily
+own the console; LiteShell restores Ratatui when they exit.
 
 When either standard input or output is redirected, lines are parsed and run
 without terminal initialization or ANSI escapes:
@@ -76,5 +78,6 @@ without terminal initialization or ANSI escapes:
 - `liteshell`: interactive/non-interactive application
 - `xtask`: verified dependency acquisition and packaging
 
-See [`docs/rust-ratatui-migration-plan.md`](docs/rust-ratatui-migration-plan.md)
-and [`docs/prd-traceability.md`](docs/prd-traceability.md).
+See [`docs/rust-ratatui-migration-plan.md`](docs/rust-ratatui-migration-plan.md),
+[`docs/colorization-design.md`](docs/colorization-design.md), and
+[`docs/prd-traceability.md`](docs/prd-traceability.md).

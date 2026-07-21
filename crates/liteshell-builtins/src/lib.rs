@@ -1,5 +1,9 @@
+mod color;
+
+use color::{file_color, highlight_lines, highlight_text, span, strong};
 use liteshell_core::{
-    CommandResult, OutputEvent, OutputSink, SearchKind, SearchProvider, ShellState,
+    CommandResult, OutputEvent, OutputSink, SearchKind, SearchProvider, SemanticColor as Color,
+    ShellState, StyledSpan, StyledText,
 };
 use std::{
     fs,
@@ -24,6 +28,9 @@ pub struct Context<'a> {
 }
 fn emit(ctx: &mut Context<'_>, text: impl Into<String>) {
     ctx.output.emit(OutputEvent::Text(text.into()));
+}
+fn emit_styled(ctx: &mut Context<'_>, spans: Vec<StyledSpan>) {
+    ctx.output.emit(OutputEvent::Styled(StyledText::new(spans)));
 }
 fn error(ctx: &mut Context<'_>, cmd: &str, text: impl AsRef<str>, status: i32) -> CommandResult {
     ctx.output
@@ -121,7 +128,7 @@ fn ls(a: &[String], c: &mut Context<'_>) -> CommandResult {
         match fs::read_dir(&target) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
-                .filter_map(|e| e.metadata().ok().map(|m| (e.path(), m)))
+                .filter_map(|e| fs::symlink_metadata(e.path()).ok().map(|m| (e.path(), m)))
                 .collect(),
             Err(e) => return error(c, "ls", e.to_string(), 1),
         }
@@ -166,10 +173,14 @@ fn ls(a: &[String], c: &mut Context<'_>) -> CommandResult {
         } else {
             String::new()
         };
-        emit(
-            c,
-            format!("{prefix}{}{}\n", n, if m.is_dir() { "\\" } else { "" }),
-        );
+        let suffix = if m.is_dir() { "\\" } else { "" };
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(span(prefix, Color::Metadata));
+        }
+        spans.push(strong(format!("{n}{suffix}"), file_color(&p, &m)));
+        spans.push(StyledSpan::plain("\n"));
+        emit_styled(c, spans);
     }
     CommandResult::ok()
 }
@@ -198,7 +209,7 @@ fn cat(a: &[String], c: &mut Context<'_>) -> CommandResult {
     for p in &a[1..] {
         let path = c.shell.resolve(p);
         match read_text(&path) {
-            Ok(s) => emit(c, s),
+            Ok(s) => c.output.emit(OutputEvent::Styled(highlight_text(&path, &s))),
             Err(e) => {
                 status = 1;
                 let msg = if e == "binary" {
@@ -238,7 +249,9 @@ fn tail(a: &[String], c: &mut Context<'_>) -> CommandResult {
     match read_text(&path) {
         Ok(s) => {
             let lines: Vec<_> = s.split_inclusive('\n').collect();
-            emit(c, lines[lines.len().saturating_sub(count)..].concat());
+            let selected = lines[lines.len().saturating_sub(count)..].concat();
+            c.output
+                .emit(OutputEvent::Styled(highlight_text(&path, &selected)));
             CommandResult::ok()
         }
         Err(e) => error(
@@ -263,10 +276,10 @@ fn less(a: &[String], c: &mut Context<'_>) -> CommandResult {
             if c.interactive {
                 c.output.emit(OutputEvent::Pager {
                     title: p.file_name().unwrap_or_default().to_string_lossy().into(),
-                    lines: s.lines().map(str::to_owned).collect(),
+                    lines: highlight_lines(&p, s.lines()),
                 })
             } else {
-                emit(c, s)
+                c.output.emit(OutputEvent::Styled(highlight_text(&p, &s)))
             }
             CommandResult::ok()
         }
@@ -341,6 +354,30 @@ fn help(a: &[String], c: &mut Context<'_>) -> CommandResult {
     if a.len() != 1 {
         return usage(c, "help", "expected no arguments");
     }
-    emit(c,"LiteShell commands:\n  cd [path]              change directory (no path uses home)\n  pwd                    print current directory\n  ls [-a] [-l] [path]    list directory contents\n  cat file...            print UTF-8 text files\n  tail [-n count] file   print the last lines\n  less file              open the built-in pager\n  clear                  clear the terminal\n  which command...       resolve commands\n  find [query]           fuzzy file search\n  rg query               indexed content search\n  exit                   leave LiteShell\n");
+    let commands = [
+        ("cd", " [path]", "change directory (no path uses home)"),
+        ("pwd", "", "print current directory"),
+        ("ls", " [-a] [-l] [path]", "list directory contents"),
+        ("cat", " file...", "print UTF-8 text files"),
+        ("tail", " [-n count] file", "print the last lines"),
+        ("less", " file", "open the built-in pager"),
+        ("clear", "", "clear the terminal"),
+        ("which", " command...", "resolve commands"),
+        ("find", " [query]", "fuzzy file search"),
+        ("rg", " query", "indexed content search"),
+        ("exit", "", "leave LiteShell"),
+    ];
+    let mut spans = vec![
+        strong("LiteShell commands", Color::Heading),
+        StyledSpan::plain(":\n"),
+    ];
+    for (command, arguments, description) in commands {
+        spans.push(StyledSpan::plain("  "));
+        spans.push(strong(command, Color::Command));
+        spans.push(span(format!("{arguments:<20}"), Color::Option));
+        spans.push(StyledSpan::plain(description));
+        spans.push(StyledSpan::plain("\n"));
+    }
+    emit_styled(c, spans);
     CommandResult::ok()
 }

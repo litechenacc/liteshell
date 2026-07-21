@@ -6,7 +6,7 @@ pub use scrollback::Scrollback;
 pub use terminal_session::TerminalSession;
 pub use ui::draw;
 
-use liteshell_core::{AppMode, Editor, OutputEvent, OutputSink};
+use liteshell_core::{AppMode, Editor, OutputEvent, OutputSink, StyledLine};
 
 #[derive(Default)]
 pub struct EventBuffer(pub Vec<OutputEvent>);
@@ -38,7 +38,7 @@ pub struct TuiState {
 
 pub struct Pager {
     pub title: String,
-    pub lines: Vec<String>,
+    pub lines: Vec<StyledLine>,
     pub top: usize,
 }
 
@@ -61,6 +61,7 @@ impl TuiState {
         for event in events {
             match event {
                 OutputEvent::Text(text) => self.output.push_text(&text, false),
+                OutputEvent::Styled(text) => self.output.push_styled(&text, false),
                 OutputEvent::Error(text) => self.output.push_text(&text, true),
                 OutputEvent::Clear => self.output.clear(),
                 OutputEvent::Status(status) => self.status = status,

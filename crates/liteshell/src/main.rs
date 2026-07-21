@@ -3,16 +3,19 @@ use crossterm::event::{
 };
 use liteshell_builtins::{dispatch, Context, NAMES};
 use liteshell_core::{
-    config::{history_path, Config},
+    config::{history_path, load_startup_environment, Config},
     history::History,
-    parser, AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider, ShellState,
+    parser, AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider,
+    ShellState,
 };
 use liteshell_fff::FffSearch;
 use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
-use liteshell_windows::{launch, resolve, WindowsCommandResolver};
+use liteshell_windows::{
+    launch, resolve, spawn_captured, terminate_process_tree, WindowsCommandResolver,
+};
 use std::{
-    io::{self, BufRead, IsTerminal, Write},
-    path::PathBuf,
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
@@ -37,6 +40,25 @@ struct RunningSearch {
     results: usize,
 }
 
+enum ExternalTaskEvent {
+    Output { text: String, error: bool },
+    Error(String),
+    Finished { status: i32 },
+}
+
+struct RunningExternal {
+    command: String,
+    receiver: Receiver<ExternalTaskEvent>,
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct RunningTasks {
+    search: Option<RunningSearch>,
+    external: Option<RunningExternal>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("liteshell: {error}");
@@ -45,6 +67,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    load_startup_environment()?;
     let shell = ShellState::new(std::env::current_dir()?);
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         interactive(shell)
@@ -62,11 +85,22 @@ impl OutputSink for PlainOutput {
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
+            OutputEvent::Styled(text) => {
+                print!("{}", text.text());
+                let _ = io::stdout().flush();
+            }
             OutputEvent::Error(text) => {
                 eprint!("{text}");
                 let _ = io::stderr().flush();
             }
-            OutputEvent::Pager { lines, .. } => println!("{}", lines.join("\n")),
+            OutputEvent::Pager { lines, .. } => println!(
+                "{}",
+                lines
+                    .iter()
+                    .map(|line| line.text())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
             OutputEvent::Clear | OutputEvent::Status(_) => {}
         }
     }
@@ -136,15 +170,12 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
     let resolver = WindowsCommandResolver;
     let mut state = TuiState::new(config.scrollback_lines, config.scrollback_bytes);
     let mut terminal = TerminalSession::enter()?;
-    let mut running_search: Option<RunningSearch> = None;
+    let mut running = RunningTasks::default();
 
     while shell.running {
-        update_running_search(
-            &mut running_search,
-            &mut state,
-            &mut shell.last_status,
-        );
-        if let Some(task) = running_search.as_ref() {
+        update_running_search(&mut running.search, &mut state, &mut shell.last_status);
+        update_running_external(&mut running.external, &mut state, &mut shell.last_status);
+        if let Some(task) = running.search.as_ref() {
             let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
             state.status = format!(
                 "{} {} {}… {} result{}",
@@ -158,13 +189,25 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                 task.results,
                 if task.results == 1 { "" } else { "s" }
             );
+        } else if let Some(task) = running.external.as_ref() {
+            let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
+            state.status = format!(
+                "{} {} {}…",
+                SPINNER[frame],
+                if task.cancelled.load(Ordering::Relaxed) {
+                    "cancelling"
+                } else {
+                    "running"
+                },
+                task.command,
+            );
         }
 
         terminal
             .terminal()
             .draw(|frame| draw(frame, &state, &shell.prompt(), shell.last_status))?;
 
-        let wait = if running_search.is_some() {
+        let wait = if running.search.is_some() || running.external.is_some() {
             Duration::from_millis(80)
         } else {
             Duration::from_secs(60)
@@ -174,7 +217,16 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
         }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if let Some(task) = running_search.as_ref() {
+                if let Some(task) = running.external.as_ref() {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        task.cancelled.store(true, Ordering::Relaxed);
+                        state.status = format!("cancelling {}…", task.command);
+                    }
+                    continue;
+                }
+                if let Some(task) = running.search.as_ref() {
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -352,7 +404,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                                 &resolver,
                                 &mut state,
                                 &mut terminal,
-                                &mut running_search,
+                                &mut running,
                             )?;
                         }
                     }
@@ -381,7 +433,7 @@ fn execute_interactive(
     resolver: &WindowsCommandResolver,
     state: &mut TuiState,
     terminal: &mut TerminalSession,
-    running_search: &mut Option<RunningSearch>,
+    running: &mut RunningTasks,
 ) -> Result<(), Box<dyn std::error::Error>> {
     state
         .output
@@ -404,7 +456,7 @@ fn execute_interactive(
             state.output.push_divider();
             return Ok(());
         }
-        *running_search = Some(start_search(
+        running.search = Some(start_search(
             arguments[0].to_ascii_lowercase(),
             arguments[1..].join(" "),
             shell.cwd.clone(),
@@ -426,11 +478,36 @@ fn execute_interactive(
     };
     state.apply(events.0);
 
-    let status = if result.handled {
-        result.status
-    } else if let Some(path) = resolve(&arguments[0], &shell.cwd) {
-        state.mode = AppMode::RunningChild;
-        terminal.suspend(|| launch(&path, &arguments[1..], &shell.cwd))??
+    if result.handled {
+        shell.last_status = result.status;
+        state.output.push_divider();
+        return Ok(());
+    }
+
+    let status = if let Some(path) = resolve(&arguments[0], &shell.cwd) {
+        if requires_terminal(&path, &arguments) {
+            state.mode = AppMode::RunningChild;
+            terminal.suspend(|| launch(&path, &arguments[1..], &shell.cwd))??
+        } else {
+            match start_external(
+                arguments[0].clone(),
+                path,
+                arguments[1..].to_vec(),
+                shell.cwd.clone(),
+            ) {
+                Ok(task) => {
+                    running.external = Some(task);
+                    state.mode = AppMode::RunningTask;
+                    return Ok(());
+                }
+                Err(error) => {
+                    state
+                        .output
+                        .push_text(&format!("{}: cannot start: {error}\n", arguments[0]), true);
+                    126
+                }
+            }
+        }
     } else {
         state
             .output
@@ -439,15 +516,184 @@ fn execute_interactive(
     };
     shell.last_status = status;
 
-    if !result.handled {
+    state.output.push_text(
+        &format!("[child exited with status {status}]\n"),
+        status != 0,
+    );
+    state.mode = AppMode::Editing;
+    state.output.push_divider();
+    Ok(())
+}
+
+fn requires_terminal(path: &Path, arguments: &[String]) -> bool {
+    let command = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| arguments.first().map(String::as_str).unwrap_or_default())
+        .to_ascii_lowercase();
+    matches!(
+        command.as_str(),
+        "cmd"
+            | "powershell"
+            | "pwsh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "wsl"
+            | "ssh"
+            | "nvim"
+            | "vim"
+            | "vi"
+            | "nano"
+            | "emacs"
+            | "hx"
+            | "helix"
+            | "less"
+            | "more"
+            | "man"
+            | "codex"
+    )
+}
+
+fn start_external(
+    command: String,
+    path: PathBuf,
+    arguments: Vec<String>,
+    cwd: PathBuf,
+) -> io::Result<RunningExternal> {
+    let mut child = spawn_captured(&path, &arguments, &cwd)?;
+    let stdout = child.stdout.take().expect("captured child stdout");
+    let stderr = child.stderr.take().expect("captured child stderr");
+    let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+
+    std::thread::spawn(move || {
+        let stdout_sender = sender.clone();
+        let stdout_reader =
+            std::thread::spawn(move || stream_external_output(stdout, false, stdout_sender));
+        let stderr_sender = sender.clone();
+        let stderr_reader =
+            std::thread::spawn(move || stream_external_output(stderr, true, stderr_sender));
+
+        let mut was_cancelled = false;
+        let status = loop {
+            if worker_cancelled.load(Ordering::Relaxed) && !was_cancelled {
+                was_cancelled = true;
+                if let Err(error) = terminate_process_tree(&mut child) {
+                    let _ = sender.send(ExternalTaskEvent::Error(format!(
+                        "cannot stop child process: {error}\n"
+                    )));
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break if was_cancelled {
+                        130
+                    } else {
+                        status.code().unwrap_or(1)
+                    }
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => {
+                    let _ = sender.send(ExternalTaskEvent::Error(format!(
+                        "cannot wait for child process: {error}\n"
+                    )));
+                    break 1;
+                }
+            }
+        };
+
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        let _ = sender.send(ExternalTaskEvent::Finished { status });
+    });
+
+    Ok(RunningExternal {
+        command,
+        receiver,
+        cancelled,
+        started: Instant::now(),
+    })
+}
+
+fn stream_external_output(reader: impl Read, error: bool, sender: mpsc::Sender<ExternalTaskEvent>) {
+    let mut reader = BufReader::new(reader);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if sender
+                    .send(ExternalTaskEvent::Output { text, error })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(ExternalTaskEvent::Error(format!(
+                    "cannot read child output: {error}\n"
+                )));
+                break;
+            }
+        }
+    }
+}
+
+fn update_running_external(
+    running: &mut Option<RunningExternal>,
+    state: &mut TuiState,
+    last_status: &mut i32,
+) {
+    let mut finished = None;
+    if let Some(task) = running.as_mut() {
+        loop {
+            match task.receiver.try_recv() {
+                Ok(ExternalTaskEvent::Output { text, error }) => {
+                    state.output.push_text(&text, error)
+                }
+                Ok(ExternalTaskEvent::Error(error)) => state.output.push_text(&error, true),
+                Ok(ExternalTaskEvent::Finished { status }) => {
+                    finished = Some(status);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    state
+                        .output
+                        .push_text("external command worker stopped unexpectedly\n", true);
+                    finished = Some(1);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(status) = finished {
+        let task = running.take().expect("running external command");
+        *last_status = status;
         state.output.push_text(
             &format!("[child exited with status {status}]\n"),
             status != 0,
         );
+        state.output.push_divider();
         state.mode = AppMode::Editing;
+        state.status = format!(
+            "{} {} · {:.1}s",
+            task.command,
+            if status == 0 {
+                "finished"
+            } else if status == 130 {
+                "cancelled"
+            } else {
+                "failed"
+            },
+            task.started.elapsed().as_secs_f32(),
+        );
     }
-    state.output.push_divider();
-    Ok(())
 }
 
 fn start_search(command: String, query: String, cwd: PathBuf) -> RunningSearch {
@@ -465,14 +711,9 @@ fn start_search(command: String, query: String, cwd: PathBuf) -> RunningSearch {
         let mut emit = |candidate| {
             let _ = sender.send(SearchTaskEvent::Candidate(candidate));
         };
-        let result = search.search_stream(
-            kind,
-            &query,
-            &cwd,
-            100,
-            &mut emit,
-            &|| worker_cancelled.load(Ordering::Relaxed),
-        );
+        let result = search.search_stream(kind, &query, &cwd, 100, &mut emit, &|| {
+            worker_cancelled.load(Ordering::Relaxed)
+        });
         let status = if worker_cancelled.load(Ordering::Relaxed) {
             130
         } else if let Err(error) = result {
@@ -928,6 +1169,39 @@ mod tests {
             .completion
             .iter()
             .any(|(value, _)| value == "$LITESHELL_COMPLETION_TEST\\directory\\"));
+    }
+
+    #[test]
+    fn terminal_programs_are_kept_out_of_captured_mode() {
+        assert!(requires_terminal(
+            Path::new(r"C:\tools\nvim.exe"),
+            &["nvim".to_owned()]
+        ));
+        assert!(requires_terminal(
+            Path::new(r"C:\tools\ssh.exe"),
+            &["ssh".to_owned(), "host".to_owned()]
+        ));
+        assert!(!requires_terminal(
+            Path::new(r"C:\tools\just.exe"),
+            &["just".to_owned(), "release".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn external_output_preserves_stream_kind() {
+        let (sender, receiver) = mpsc::channel();
+        stream_external_output("first\nsecond".as_bytes(), true, sender);
+
+        let events: Vec<_> = receiver.into_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ExternalTaskEvent::Output { text, error: true } if text == "first\n"
+        ));
+        assert!(matches!(
+            &events[1],
+            ExternalTaskEvent::Output { text, error: true } if text == "second"
+        ));
     }
 
     #[cfg(windows)]
