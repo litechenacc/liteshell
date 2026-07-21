@@ -69,8 +69,12 @@ without terminal initialization or ANSI escapes:
 
 ## Commands
 
-`cd`, `pwd`, `ls`, `cat`, `tail`, `less`, `clear`, `which`, `find`, `rg`, `help`,
-`exit`, and foreground `.exe`, `.com`, `.cmd`, `.bat`, and `.ps1` commands.
+Rust builtins: `cd`, `pwd`, `ls`, `mkdir`, `rm`, `touch`, `cat`, `tail`, `less`,
+`clear`, `which`, `find`, `rg`, `help`, and `exit`.
+
+Windows command translations: `ps` (to `tasklist.exe`) and `kill` (to
+`taskkill.exe`). Foreground `.exe`, `.com`, `.cmd`, `.bat`, and `.ps1` commands
+remain supported.
 
 ## Architecture
 
@@ -84,4 +88,6 @@ without terminal initialization or ANSI escapes:
 
 See [`docs/rust-ratatui-migration-plan.md`](docs/rust-ratatui-migration-plan.md),
 [`docs/colorization-design.md`](docs/colorization-design.md), and
-[`docs/prd-traceability.md`](docs/prd-traceability.md).
+[`docs/prd-traceability.md`](docs/prd-traceability.md). The command implementation
+rule and supported Unix-like interfaces are documented in
+[`docs/command-implementation-policy.md`](docs/command-implementation-policy.md).

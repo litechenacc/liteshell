@@ -12,7 +12,8 @@ use liteshell_core::{
 use liteshell_fff::FffSearch;
 use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
 use liteshell_windows::{
-    launch, resolve, spawn_captured, terminate_process_tree, WindowsCommandResolver,
+    launch, resolve, spawn_captured, terminate_process_tree, translate, WindowsCommandResolver,
+    TRANSLATED_NAMES,
 };
 use std::{
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
@@ -159,14 +160,22 @@ fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
 
         let status = if result.handled {
             result.status
-        } else if let Some(path) = resolve(&arguments[0], &shell.cwd) {
-            launch(&path, &arguments[1..], &shell.cwd).unwrap_or_else(|error| {
-                eprintln!("{}: cannot start: {error}", arguments[0]);
-                126
-            })
         } else {
-            eprintln!("{}: command not found", arguments[0]);
-            127
+            match external_invocation(&arguments, &shell.cwd) {
+                Ok(Some((path, translated_args))) => launch(&path, &translated_args, &shell.cwd)
+                    .unwrap_or_else(|error| {
+                        eprintln!("{}: cannot start: {error}", arguments[0]);
+                        126
+                    }),
+                Ok(None) => {
+                    eprintln!("{}: command not found", arguments[0]);
+                    127
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    2
+                }
+            }
         };
         shell.last_status = status;
         if result.handled && result.status == 0 && shell.cwd != previous_cwd {
@@ -573,15 +582,16 @@ fn execute_interactive(
         return Ok(());
     }
 
-    let status = if let Some(path) = resolve(&arguments[0], &shell.cwd) {
-        if requires_terminal(&path, &arguments) {
+    let status = match external_invocation(&arguments, &shell.cwd) {
+        Ok(Some((path, translated_args))) if requires_terminal(&path, &arguments) => {
             state.mode = AppMode::RunningChild;
-            terminal.suspend(|| launch(&path, &arguments[1..], &shell.cwd))??
-        } else {
+            terminal.suspend(|| launch(&path, &translated_args, &shell.cwd))??
+        }
+        Ok(Some((path, translated_args))) => {
             match start_external(
                 arguments[0].clone(),
                 path,
-                arguments[1..].to_vec(),
+                translated_args,
                 shell.cwd.clone(),
             ) {
                 Ok(task) => {
@@ -597,11 +607,16 @@ fn execute_interactive(
                 }
             }
         }
-    } else {
-        state
-            .output
-            .push_text(&format!("{}: command not found\n", arguments[0]), true);
-        127
+        Ok(None) => {
+            state
+                .output
+                .push_text(&format!("{}: command not found\n", arguments[0]), true);
+            127
+        }
+        Err(error) => {
+            state.output.push_text(&format!("{error}\n"), true);
+            2
+        }
     };
     shell.last_status = status;
 
@@ -612,6 +627,18 @@ fn execute_interactive(
     state.mode = AppMode::Editing;
     state.output.push_divider();
     Ok(())
+}
+
+fn external_invocation(
+    arguments: &[String],
+    cwd: &Path,
+) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    if let Some(translated) = translate(&arguments[0], &arguments[1..], cwd) {
+        return translated
+            .map(|command| Some((command.path, command.args)))
+            .map_err(|error| error.to_string());
+    }
+    Ok(resolve(&arguments[0], cwd).map(|path| (path, arguments[1..].to_vec())))
 }
 
 fn requires_terminal(path: &Path, arguments: &[String]) -> bool {
@@ -1052,6 +1079,15 @@ fn complete_with_sources(
             fuzzy_score(name, &token)
                 .map(|score| (score as i64, (*name).to_owned(), "builtin".to_owned()))
         }));
+        values.extend(TRANSLATED_NAMES.iter().filter_map(|name| {
+            fuzzy_score(name, &token).map(|score| {
+                (
+                    score as i64,
+                    (*name).to_owned(),
+                    "windows translation".to_owned(),
+                )
+            })
+        }));
     } else {
         let expandable_root = matches!(token.as_str(), "~" | "." | "..")
             || environment_prefix(&token).is_some_and(|(_, consumed)| consumed == token.len());
@@ -1339,7 +1375,7 @@ fn should_open_path_completion(state: &TuiState) -> bool {
     let command = before_cursor.split_whitespace().next().unwrap_or_default();
     matches!(
         command.to_ascii_lowercase().as_str(),
-        "cd" | "ls" | "cat" | "tail" | "less" | "find" | "rg"
+        "cd" | "ls" | "mkdir" | "rm" | "touch" | "cat" | "tail" | "less" | "find" | "rg"
     )
 }
 

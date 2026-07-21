@@ -4,6 +4,22 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
+use thiserror::Error;
+
+pub const TRANSLATED_NAMES: &[&str] = &["ps", "kill"];
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct TranslatedCommand {
+    pub path: PathBuf,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+#[error("{command}: {message}")]
+pub struct TranslationError {
+    pub command: &'static str,
+    pub message: String,
+}
 
 #[derive(Default)]
 pub struct WindowsCommandResolver;
@@ -12,8 +28,163 @@ pub struct WindowsCommandResolver;
 const EXTS: &[&str] = &["exe", "com", "cmd", "bat", "ps1", ""];
 impl CommandResolver for WindowsCommandResolver {
     fn resolve(&self, command: &str, cwd: &Path) -> Option<PathBuf> {
-        resolve(command, cwd)
+        resolve(translated_target(command).unwrap_or(command), cwd)
     }
+
+    fn describe(&self, command: &str, cwd: &Path) -> Option<String> {
+        let target = translated_target(command);
+        let path = resolve(target.unwrap_or(command), cwd)?;
+        Some(match target {
+            Some(target) => format!("windows translation -> {target} ({})", path.display()),
+            None => path.display().to_string(),
+        })
+    }
+}
+
+fn translated_target(command: &str) -> Option<&'static str> {
+    match command.to_ascii_lowercase().as_str() {
+        "ps" => Some("tasklist.exe"),
+        "kill" => Some("taskkill.exe"),
+        _ => None,
+    }
+}
+
+pub fn translate(
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+) -> Option<Result<TranslatedCommand, TranslationError>> {
+    match command.to_ascii_lowercase().as_str() {
+        "ps" => Some(translate_ps(args, cwd)),
+        "kill" => Some(translate_kill(args, cwd)),
+        _ => None,
+    }
+}
+
+fn translated_command(
+    command: &'static str,
+    target: &'static str,
+    args: Vec<String>,
+    cwd: &Path,
+) -> Result<TranslatedCommand, TranslationError> {
+    let path = resolve(target, cwd).ok_or_else(|| TranslationError {
+        command,
+        message: format!("Windows command not found: {target}"),
+    })?;
+    Ok(TranslatedCommand { path, args })
+}
+
+fn translate_ps(args: &[String], cwd: &Path) -> Result<TranslatedCommand, TranslationError> {
+    let mut verbose = false;
+    let mut query = None;
+    let mut end = false;
+    for value in args {
+        if !end && value == "--" {
+            end = true;
+        } else if !end && value == "aux" {
+            verbose = true;
+        } else if !end && value.starts_with('-') && value.len() > 1 {
+            for option in value[1..].chars() {
+                match option {
+                    'a' | 'x' => {}
+                    'u' | 'v' => verbose = true,
+                    _ => return translation_usage("ps", format!("unknown option: -{option}")),
+                }
+            }
+        } else if query.replace(value).is_some() {
+            return translation_usage("ps", "expected at most one name or PID");
+        }
+    }
+
+    let mut translated = vec!["/fo".to_owned(), "table".to_owned()];
+    if verbose {
+        translated.push("/v".to_owned());
+    }
+    if let Some(query) = query {
+        if query.contains('"') {
+            return translation_usage("ps", "query cannot contain a double quote");
+        }
+        translated.push("/fi".to_owned());
+        translated.push(if query.parse::<u32>().is_ok() {
+            format!("PID eq {query}")
+        } else {
+            format!("IMAGENAME eq *{query}*")
+        });
+    }
+    translated_command("ps", "tasklist.exe", translated, cwd)
+}
+
+fn translate_kill(args: &[String], cwd: &Path) -> Result<TranslatedCommand, TranslationError> {
+    let mut force = false;
+    let mut tree = false;
+    let mut pids = Vec::new();
+    let mut end = false;
+    let mut index = 0;
+    while index < args.len() {
+        let value = &args[index];
+        if !end && value == "--" {
+            end = true;
+        } else if !end && value == "--tree" {
+            tree = true;
+        } else if !end && matches!(value.as_str(), "-s" | "--signal") {
+            index += 1;
+            let signal = args.get(index).ok_or_else(|| TranslationError {
+                command: "kill",
+                message: format!("{value} requires TERM or KILL"),
+            })?;
+            force = parse_signal(signal)?;
+        } else if !end && value.starts_with("--signal=") {
+            force = parse_signal(value.trim_start_matches("--signal="))?;
+        } else if !end && value.starts_with('-') {
+            force = parse_signal(&value[1..])?;
+        } else {
+            let pid = value.parse::<u32>().map_err(|_| TranslationError {
+                command: "kill",
+                message: format!("invalid PID: {value}"),
+            })?;
+            if pid == 0 {
+                return translation_usage("kill", "PID must be greater than zero");
+            }
+            pids.push(pid);
+        }
+        index += 1;
+    }
+    if pids.is_empty() {
+        return translation_usage("kill", "expected at least one PID");
+    }
+
+    let mut translated = Vec::new();
+    for pid in pids {
+        translated.extend(["/pid".to_owned(), pid.to_string()]);
+    }
+    if force {
+        translated.push("/f".to_owned());
+    }
+    if tree {
+        translated.push("/t".to_owned());
+    }
+    translated_command("kill", "taskkill.exe", translated, cwd)
+}
+
+fn parse_signal(value: &str) -> Result<bool, TranslationError> {
+    match value.to_ascii_uppercase().trim_start_matches("SIG") {
+        "TERM" | "15" => Ok(false),
+        "KILL" | "9" => Ok(true),
+        _ => translation_usage(
+            "kill",
+            format!("unsupported signal: {value}; use TERM or KILL"),
+        ),
+    }
+}
+
+fn translation_usage<T>(
+    command: &'static str,
+    message: impl Into<String>,
+) -> Result<T, TranslationError> {
+    Err(TranslationError {
+        command,
+        message: message.into(),
+    })
 }
 pub fn resolve(command: &str, cwd: &Path) -> Option<PathBuf> {
     let p = Path::new(command);
@@ -188,5 +359,52 @@ mod tests {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("out"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("err"));
+    }
+
+    #[test]
+    fn ps_aux_query_translates_to_verbose_tasklist_filter() {
+        let command = translate_ps(
+            &["aux".to_owned(), "code".to_owned()],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            command.args,
+            ["/fo", "table", "/v", "/fi", "IMAGENAME eq *code*"]
+        );
+        assert_eq!(command.path.file_name().unwrap(), "tasklist.exe");
+    }
+
+    #[test]
+    fn numeric_ps_query_uses_pid_filter() {
+        let command =
+            translate_ps(&["1234".to_owned()], &std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(command.args, ["/fo", "table", "/fi", "PID eq 1234"]);
+    }
+
+    #[test]
+    fn kill_supports_unix_signal_spelling_and_process_trees() {
+        let command = translate_kill(
+            &[
+                "-KILL".to_owned(),
+                "--tree".to_owned(),
+                "1234".to_owned(),
+                "5678".to_owned(),
+            ],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(command.args, ["/pid", "1234", "/pid", "5678", "/f", "/t"]);
+        assert_eq!(command.path.file_name().unwrap(), "taskkill.exe");
+    }
+
+    #[test]
+    fn kill_rejects_signals_windows_cannot_represent() {
+        let error = translate_kill(
+            &["-HUP".to_owned(), "1234".to_owned()],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("unsupported signal"));
     }
 }

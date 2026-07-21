@@ -7,17 +7,23 @@ use liteshell_core::{
 };
 use std::{
     fs,
+    fs::{FileTimes, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
 pub const NAMES: &[&str] = &[
-    "cd", "pwd", "ls", "cat", "tail", "less", "clear", "which", "find", "rg", "help", "exit",
-    "quit",
+    "cd", "pwd", "ls", "mkdir", "rm", "touch", "cat", "tail", "less", "clear", "which", "find",
+    "rg", "help", "exit", "quit",
 ];
 pub trait CommandResolver {
     fn resolve(&self, command: &str, cwd: &Path) -> Option<PathBuf>;
+
+    fn describe(&self, command: &str, cwd: &Path) -> Option<String> {
+        self.resolve(command, cwd)
+            .map(|path| path.display().to_string())
+    }
 }
 pub struct Context<'a> {
     pub shell: &'a mut ShellState,
@@ -57,6 +63,9 @@ pub fn dispatch(args: &[String], ctx: &mut Context<'_>) -> CommandResult {
         "cd" => cd(args, ctx),
         "pwd" => pwd(args, ctx),
         "ls" => ls(args, ctx),
+        "mkdir" => mkdir(args, ctx),
+        "rm" => rm(args, ctx),
+        "touch" => touch(args, ctx),
         "cat" => cat(args, ctx),
         "tail" => tail(args, ctx),
         "less" => less(args, ctx),
@@ -68,6 +77,165 @@ pub fn dispatch(args: &[String], ctx: &mut Context<'_>) -> CommandResult {
         _ => CommandResult::unhandled(),
     }
 }
+
+fn mkdir(a: &[String], c: &mut Context<'_>) -> CommandResult {
+    let mut parents = false;
+    let mut paths = Vec::new();
+    let mut end = false;
+    for value in &a[1..] {
+        if !end && value == "--" {
+            end = true;
+        } else if !end && matches!(value.as_str(), "-p" | "--parents") {
+            parents = true;
+        } else if !end && value.starts_with('-') {
+            return usage(c, "mkdir", &format!("unknown option: {value}"));
+        } else {
+            paths.push(value);
+        }
+    }
+    if paths.is_empty() {
+        return usage(c, "mkdir", "expected at least one directory");
+    }
+
+    let mut status = 0;
+    for raw in paths {
+        let path = c.shell.resolve(raw);
+        let result = if parents {
+            fs::create_dir_all(&path)
+        } else {
+            fs::create_dir(&path)
+        };
+        if let Err(e) = result {
+            status = 1;
+            error(c, "mkdir", format!("{}: {e}", path.display()), 1);
+        }
+    }
+    CommandResult::status(status)
+}
+
+fn rm(a: &[String], c: &mut Context<'_>) -> CommandResult {
+    let mut force = false;
+    let mut recursive = false;
+    let mut paths = Vec::new();
+    let mut end = false;
+    for value in &a[1..] {
+        if !end && value == "--" {
+            end = true;
+        } else if !end && value.starts_with('-') && value.len() > 1 {
+            for option in value[1..].chars() {
+                match option {
+                    'f' => force = true,
+                    'r' | 'R' => recursive = true,
+                    _ => return usage(c, "rm", &format!("unknown option: -{option}")),
+                }
+            }
+        } else {
+            paths.push(value);
+        }
+    }
+    if paths.is_empty() {
+        return usage(c, "rm", "expected at least one path");
+    }
+
+    let mut status = 0;
+    for raw in paths {
+        let path = c.shell.resolve(raw);
+        if recursive && unsafe_recursive_target(Path::new(raw), &path) {
+            status = 1;
+            error(
+                c,
+                "rm",
+                format!("refusing to recursively remove: {}", path.display()),
+                1,
+            );
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                status = 1;
+                error(c, "rm", format!("{}: {e}", path.display()), 1);
+                continue;
+            }
+        };
+        let file_type = metadata.file_type();
+        let result = if directory_link(&file_type) {
+            fs::remove_dir(&path)
+        } else if metadata.is_dir() {
+            if recursive {
+                fs::remove_dir_all(&path)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "is a directory (use -r to remove recursively)",
+                ))
+            }
+        } else {
+            fs::remove_file(&path)
+        };
+        if let Err(e) = result {
+            status = 1;
+            error(c, "rm", format!("{}: {e}", path.display()), 1);
+        }
+    }
+    CommandResult::status(status)
+}
+
+fn unsafe_recursive_target(raw: &Path, resolved: &Path) -> bool {
+    use std::path::Component;
+    matches!(
+        raw.components().next_back(),
+        Some(Component::CurDir | Component::ParentDir)
+    ) || resolved.parent().is_none()
+        || fs::canonicalize(resolved).is_ok_and(|path| path.parent().is_none())
+}
+
+fn directory_link(file_type: &fs::FileType) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        file_type.is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        file_type.is_symlink()
+    }
+}
+
+fn touch(a: &[String], c: &mut Context<'_>) -> CommandResult {
+    let mut paths = Vec::new();
+    let mut end = false;
+    for value in &a[1..] {
+        if !end && value == "--" {
+            end = true;
+        } else if !end && value.starts_with('-') {
+            return usage(c, "touch", &format!("unknown option: {value}"));
+        } else {
+            paths.push(value);
+        }
+    }
+    if paths.is_empty() {
+        return usage(c, "touch", "expected at least one file");
+    }
+
+    let now = SystemTime::now();
+    let mut status = 0;
+    for raw in paths {
+        let path = c.shell.resolve(raw);
+        let result = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|file| file.set_times(FileTimes::new().set_modified(now)));
+        if let Err(e) = result {
+            status = 1;
+            error(c, "touch", format!("{}: {e}", path.display()), 1);
+        }
+    }
+    CommandResult::status(status)
+}
+
 fn cd(a: &[String], c: &mut Context<'_>) -> CommandResult {
     if a.len() > 2 {
         return usage(c, "cd", "expected zero or one path");
@@ -312,8 +480,8 @@ fn which(a: &[String], c: &mut Context<'_>) -> CommandResult {
     for x in &a[1..] {
         if NAMES.iter().any(|n| n.eq_ignore_ascii_case(x)) {
             emit(c, format!("{x}: builtin\n"))
-        } else if let Some(p) = c.resolver.resolve(x, &c.shell.cwd) {
-            emit(c, format!("{x}: {}\n", p.display()))
+        } else if let Some(description) = c.resolver.describe(x, &c.shell.cwd) {
+            emit(c, format!("{x}: {description}\n"))
         } else {
             s = 1;
             error(c, "which", format!("command not found: {x}"), 1);
@@ -360,6 +528,9 @@ fn help(a: &[String], c: &mut Context<'_>) -> CommandResult {
         ("cd", " [path]", "change directory (no path uses home)"),
         ("pwd", "", "print current directory"),
         ("ls", " [-a] [-l] [path]", "list directory contents"),
+        ("mkdir", " [-p] directory...", "create directories"),
+        ("rm", " [-f] [-r] path...", "remove files or directories"),
+        ("touch", " file...", "create files or update timestamps"),
         ("cat", " file...", "print UTF-8 text files"),
         ("tail", " [-n count] file", "print the last lines"),
         ("less", " file", "open the built-in pager"),
@@ -367,6 +538,16 @@ fn help(a: &[String], c: &mut Context<'_>) -> CommandResult {
         ("which", " command...", "resolve commands"),
         ("find", " [query]", "fuzzy file search"),
         ("rg", " query", "indexed content search"),
+        (
+            "ps",
+            " [aux|-aux] [name|pid]",
+            "list/filter processes (Windows translation)",
+        ),
+        (
+            "kill",
+            " [-s TERM|KILL] [--tree] pid...",
+            "end processes (Windows translation)",
+        ),
         ("exit", "", "leave LiteShell"),
     ];
     let mut spans = vec![
