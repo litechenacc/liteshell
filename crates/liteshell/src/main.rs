@@ -1,21 +1,29 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use liteshell_builtins::{dispatch, overview_text, version_text, Context, NAMES};
 use liteshell_core::{
-    config::{directory_db_path, history_path, load_startup, Config},
+    config::{directory_db_path, history_path, load_startup, Config, StartupConfig},
     directory_db::{frecency, now_epoch, DirectoryDb},
     history::History,
     parser::{self, Aliases},
     AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider, ShellState,
 };
 use liteshell_fff::FffSearch;
-use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
+use liteshell_tui::{
+    draw, selected_pager_text, selected_transcript_text, CompletionSource, EventBuffer,
+    TerminalSession, TuiState,
+};
 use liteshell_windows::{
-    is_supported_executable, launch, resolve, spawn_captured, terminate_process_tree, translate,
+    build_command, get_clipboard_text, is_supported_executable, launch, resolve,
+    set_clipboard_text, spawn_captured, terminate_process_tree, translate, ProcessJob,
     WindowsCommandResolver, TRANSLATED_NAMES,
 };
 use std::{
+    collections::{HashMap, HashSet},
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
@@ -67,16 +75,30 @@ struct RunningDeepCompletion {
     started: Instant,
 }
 
+enum NativeCompletionEvent {
+    Finished(Result<Vec<(String, String)>, String>),
+}
+
+struct RunningNativeCompletion {
+    request: String,
+    receiver: Receiver<NativeCompletionEvent>,
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+}
+
 #[derive(Default)]
 struct RunningTasks {
     search: Option<RunningSearch>,
     external: Option<RunningExternal>,
     deep_completion: Option<RunningDeepCompletion>,
+    native_completion: Option<RunningNativeCompletion>,
 }
 
 struct InteractiveCommands {
     resolver: WindowsCommandResolver,
     aliases: Aliases,
+    path_commands: Vec<(String, String)>,
+    completion_providers: HashMap<String, String>,
 }
 
 fn main() {
@@ -172,7 +194,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Invocation::Auto { statusline }
             if io::stdin().is_terminal() && io::stdout().is_terminal() =>
         {
-            interactive(shell, startup.aliases, statusline)?;
+            interactive(shell, startup, statusline)?;
             Ok(0)
         }
         Invocation::Auto { .. } => plain(shell, startup.aliases),
@@ -286,7 +308,7 @@ fn plain(mut shell: ShellState, aliases: Aliases) -> Result<i32, Box<dyn std::er
 
 fn interactive(
     mut shell: ShellState,
-    aliases: Aliases,
+    startup: StartupConfig,
     show_statusline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();
@@ -298,9 +320,18 @@ fn interactive(
     let mut directory_db = DirectoryDb::new(directory_db_path());
     let _ = directory_db.load();
     directory_db.record(&shell.cwd);
+    let mut completion_providers = HashMap::from([("just".to_owned(), "JUST_COMPLETE".to_owned())]);
+    for provider in startup.completions {
+        completion_providers.insert(
+            provider.command.to_ascii_lowercase(),
+            provider.environment_variable,
+        );
+    }
     let commands = InteractiveCommands {
         resolver: WindowsCommandResolver,
-        aliases,
+        aliases: startup.aliases,
+        path_commands: discover_path_commands(),
+        completion_providers,
     };
     let mut state = TuiState::new(config.scrollback_lines, config.scrollback_bytes);
     let mut terminal = TerminalSession::enter()?;
@@ -308,9 +339,11 @@ fn interactive(
 
     while shell.running {
         let _ = directory_db.flush_if_due(DIRECTORY_DB_FLUSH_INTERVAL);
+        state.update_scroll_flash();
         update_running_search(&mut running.search, &mut state, &mut shell.last_status);
         update_running_external(&mut running.external, &mut state, &mut shell.last_status);
         update_deep_completion(&mut running.deep_completion, &mut state);
+        update_native_completion(&mut running.native_completion, &mut state);
         if let Some(task) = running.search.as_ref() {
             let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
             state.status = format!(
@@ -340,6 +373,9 @@ fn interactive(
         } else if let Some(task) = running.deep_completion.as_ref() {
             let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
             state.status = format!("{} searching directories…", SPINNER[frame]);
+        } else if let Some(task) = running.native_completion.as_ref() {
+            let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
+            state.status = format!("{} asking command for completions…", SPINNER[frame]);
         }
 
         terminal.terminal().draw(|frame| {
@@ -352,9 +388,15 @@ fn interactive(
             )
         })?;
 
+        let terminal_height = terminal.terminal().size()?.height as usize;
+        let terminal_width = terminal.terminal().size()?.width as usize;
+        let transcript_height = terminal_height.saturating_sub(usize::from(show_statusline));
+
         let wait = if running.search.is_some()
             || running.external.is_some()
             || running.deep_completion.is_some()
+            || running.native_completion.is_some()
+            || state.scroll_flash_active()
         {
             Duration::from_millis(80)
         } else {
@@ -384,13 +426,43 @@ fn interactive(
                     continue;
                 }
                 if state.mode == AppMode::Pager {
-                    handle_pager_key(&mut state, key);
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && state.has_pager_selection()
+                    {
+                        copy_pager_selection(&mut state, terminal_width);
+                        continue;
+                    }
+                    if key.code == KeyCode::Esc && state.has_pager_selection() {
+                        state.clear_pager_selection();
+                        state.status.clear();
+                        continue;
+                    }
+                    handle_pager_key(
+                        &mut state,
+                        key,
+                        terminal_height.saturating_sub(1),
+                        terminal_width,
+                    );
                     continue;
+                }
+
+                let preserves_selection =
+                    matches!(key.code, KeyCode::Esc | KeyCode::PageUp | KeyCode::PageDown)
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL));
+                if !preserves_selection {
+                    state.clear_transcript_selection();
                 }
 
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if state.has_transcript_selection() {
+                            copy_transcript_selection(&mut state, &shell.prompt(), terminal_width);
+                            continue;
+                        }
                         cancel_deep_completion(&mut running.deep_completion);
+                        cancel_native_completion(&mut running.native_completion);
                         if !state.editor.text.is_empty() {
                             state.output.push_text(
                                 &format!("{}{}^C\n", shell.prompt(), state.editor.text),
@@ -415,6 +487,7 @@ fn interactive(
                         refresh_history_completion(history.entries(), &mut state);
                     }
                     KeyCode::Char(character) => {
+                        state.clear_transcript_selection();
                         state.status.clear();
                         if state.mode == AppMode::Completion
                             && state.completion_source == CompletionSource::History
@@ -428,14 +501,17 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
                         }
                     }
                     KeyCode::Backspace => {
+                        state.clear_transcript_selection();
                         if state.mode == AppMode::Completion
                             && state.completion_source == CompletionSource::History
                         {
@@ -448,14 +524,17 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
                         }
                     }
                     KeyCode::Delete => {
+                        state.clear_transcript_selection();
                         if !(state.mode == AppMode::Completion
                             && state.completion_source == CompletionSource::History)
                         {
@@ -465,8 +544,10 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
@@ -482,8 +563,10 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
@@ -499,8 +582,10 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
@@ -547,8 +632,10 @@ fn interactive(
                                 complete_with_sources(
                                     &shell,
                                     &mut state,
+                                    &commands,
                                     Some(&directory_db),
                                     &mut running.deep_completion,
+                                    &mut running.native_completion,
                                     &config.deep_search_exclude_dirs,
                                 );
                             }
@@ -557,13 +644,21 @@ fn interactive(
                         }
                     }
                     KeyCode::Esc => {
+                        if state.has_transcript_selection() {
+                            state.clear_transcript_selection();
+                            state.status.clear();
+                            continue;
+                        }
                         cancel_deep_completion(&mut running.deep_completion);
+                        cancel_native_completion(&mut running.native_completion);
                         state.completion.clear();
                         state.completion_query.clear();
                         state.completion_source = CompletionSource::Path;
                         state.mode = AppMode::Editing;
                     }
                     KeyCode::Enter => {
+                        state.clear_transcript_selection();
+                        cancel_native_completion(&mut running.native_completion);
                         if state.mode == AppMode::Completion
                             && state.completion_source == CompletionSource::History
                             && state.completion.is_empty()
@@ -609,11 +704,142 @@ fn interactive(
                             }
                         }
                     }
-                    KeyCode::PageUp => state.output.scroll_up(10),
-                    KeyCode::PageDown => state.output.scroll_down(10),
+                    KeyCode::PageUp => {
+                        scroll_transcript_up(
+                            &mut state,
+                            transcript_height.saturating_sub(1).max(1),
+                            transcript_height,
+                        );
+                    }
+                    KeyCode::PageDown => {
+                        scroll_transcript_down(
+                            &mut state,
+                            transcript_height.saturating_sub(1).max(1),
+                            transcript_height,
+                        );
+                    }
                     _ => {}
                 }
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if state.mode == AppMode::Pager {
+                        if mouse.row < terminal_height.saturating_sub(1) as u16
+                            && state.begin_pager_selection(
+                                mouse.column,
+                                mouse.row,
+                                terminal_height.saturating_sub(1),
+                                terminal_width,
+                            )
+                        {
+                            state.status = "selecting text…".into();
+                        } else {
+                            state.clear_pager_selection();
+                        }
+                    } else if matches!(state.mode, AppMode::Editing | AppMode::Completion)
+                        && mouse.row < transcript_height as u16
+                        && state.begin_transcript_selection(
+                            mouse.column,
+                            mouse.row,
+                            transcript_height,
+                        )
+                    {
+                        cancel_deep_completion(&mut running.deep_completion);
+                        cancel_native_completion(&mut running.native_completion);
+                        state.completion.clear();
+                        state.completion_query.clear();
+                        state.completion_source = CompletionSource::Path;
+                        state.mode = AppMode::Editing;
+                        state.status = "selecting text…".into();
+                    } else if state.mode != AppMode::Pager {
+                        state.clear_transcript_selection();
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if state.mode == AppMode::Pager {
+                        state.update_pager_selection(
+                            mouse.column,
+                            mouse.row.min(terminal_height.saturating_sub(2) as u16),
+                            terminal_height.saturating_sub(1),
+                            terminal_width,
+                        );
+                    } else if matches!(state.mode, AppMode::Editing | AppMode::Completion) {
+                        state.update_transcript_selection(
+                            mouse.column,
+                            mouse.row.min(transcript_height.saturating_sub(1) as u16),
+                            transcript_height,
+                        );
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if state.mode == AppMode::Pager {
+                        state.update_pager_selection(
+                            mouse.column,
+                            mouse.row.min(terminal_height.saturating_sub(2) as u16),
+                            terminal_height.saturating_sub(1),
+                            terminal_width,
+                        );
+                        if state.finish_pager_selection() {
+                            copy_pager_selection(&mut state, terminal_width);
+                        } else {
+                            state.status.clear();
+                        }
+                    } else if matches!(state.mode, AppMode::Editing | AppMode::Completion) {
+                        state.update_transcript_selection(
+                            mouse.column,
+                            mouse.row.min(transcript_height.saturating_sub(1) as u16),
+                            transcript_height,
+                        );
+                        if state.finish_transcript_selection() {
+                            copy_transcript_selection(&mut state, &shell.prompt(), terminal_width);
+                        } else {
+                            state.status.clear();
+                        }
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if state.mode == AppMode::Pager && state.has_pager_selection() {
+                        copy_pager_selection(&mut state, terminal_width);
+                        state.clear_pager_selection();
+                    } else if state.has_transcript_selection() {
+                        copy_transcript_selection(&mut state, &shell.prompt(), terminal_width);
+                        state.clear_transcript_selection();
+                    } else if matches!(state.mode, AppMode::Editing | AppMode::Completion) {
+                        cancel_deep_completion(&mut running.deep_completion);
+                        cancel_native_completion(&mut running.native_completion);
+                        state.completion.clear();
+                        state.completion_query.clear();
+                        state.completion_source = CompletionSource::Path;
+                        state.mode = AppMode::Editing;
+                        paste_clipboard(&mut state);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if state.mode == AppMode::Pager {
+                        scroll_pager_up(
+                            &mut state,
+                            3,
+                            terminal_height.saturating_sub(1),
+                            terminal_width,
+                        );
+                    } else {
+                        scroll_transcript_up(&mut state, 3, transcript_height);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if state.mode == AppMode::Pager {
+                        scroll_pager_down(
+                            &mut state,
+                            3,
+                            terminal_height.saturating_sub(1),
+                            terminal_width,
+                        );
+                    } else {
+                        scroll_transcript_down(&mut state, 3, transcript_height);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1144,16 +1370,243 @@ fn current_completion_token(state: &TuiState) -> String {
     before_cursor[token_start..].to_owned()
 }
 
+fn executable_command_name(path: &Path) -> Option<String> {
+    if !is_supported_executable(path) {
+        return None;
+    }
+    let file_name = path.file_name()?.to_string_lossy();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "exe" | "com" | "cmd" | "bat" | "ps1"
+    ) {
+        path.file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+    } else {
+        Some(file_name.into_owned())
+    }
+}
+
+fn command_candidates_in_directory(
+    directory: &Path,
+    source: &str,
+    rank: i64,
+    query: &str,
+) -> Vec<(i64, String, String)> {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = executable_command_name(&entry.path())?;
+            let score = fuzzy_score(&name, query)?;
+            Some((rank + score as i64, name, format!("{source} executable")))
+        })
+        .collect()
+}
+
+fn discover_path_commands() -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut commands = Vec::new();
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for (_, name, detail) in command_candidates_in_directory(&directory, "PATH", 0, "") {
+            if seen.insert(name.to_ascii_lowercase()) {
+                commands.push((name, detail));
+            }
+        }
+    }
+    commands.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+    });
+    commands
+}
+
+struct NativeCompletionRequest {
+    key: String,
+    path: PathBuf,
+    args: Vec<String>,
+    environment_variable: String,
+    cwd: PathBuf,
+}
+
+fn native_completion_request(
+    shell: &ShellState,
+    before_cursor: &str,
+    aliases: &Aliases,
+    providers: &HashMap<String, String>,
+) -> Option<NativeCompletionRequest> {
+    let mut args = parser::parse_with_aliases(before_cursor, aliases).ok()?;
+    let command = args.first()?.to_ascii_lowercase();
+    let environment_variable = providers.get(&command)?.clone();
+    let path = resolve(&args[0], &shell.cwd)?;
+    if before_cursor
+        .chars()
+        .last()
+        .is_some_and(char::is_whitespace)
+    {
+        args.push(String::new());
+    }
+    Some(NativeCompletionRequest {
+        key: before_cursor.to_owned(),
+        path,
+        args,
+        environment_variable,
+        cwd: shell.cwd.clone(),
+    })
+}
+
+fn start_native_completion(request: NativeCompletionRequest) -> RunningNativeCompletion {
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let key = request.key.clone();
+    std::thread::spawn(move || {
+        let mut invocation_args = Vec::with_capacity(request.args.len() + 1);
+        invocation_args.push("--".to_owned());
+        invocation_args.extend(request.args);
+        let result = (|| -> Result<Vec<(String, String)>, String> {
+            let job = ProcessJob::kill_on_close().ok();
+            let mut child = build_command(&request.path, &invocation_args, &request.cwd)
+                .env(&request.environment_variable, "powershell")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            if let Some(job) = job.as_ref() {
+                let _ = job.assign(&child);
+            }
+            let mut stdout = child.stdout.take().expect("piped completion stdout");
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            let started = Instant::now();
+            loop {
+                if worker_cancelled.load(Ordering::Relaxed) || started.elapsed() >= TIMEOUT {
+                    let _ = terminate_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(if worker_cancelled.load(Ordering::Relaxed) {
+                        "cancelled".to_owned()
+                    } else {
+                        "timed out after 500 ms".to_owned()
+                    });
+                }
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            let status = child.wait().map_err(|error| error.to_string())?;
+            let output = reader
+                .join()
+                .map_err(|_| "completion output reader panicked".to_owned())?
+                .map_err(|error| error.to_string())?;
+            if !status.success() {
+                return Err(format!("provider exited with {status}"));
+            }
+            Ok(parse_native_completion_output(&output))
+        })();
+        if !worker_cancelled.load(Ordering::Relaxed) {
+            let _ = sender.send(NativeCompletionEvent::Finished(result));
+        }
+    });
+    RunningNativeCompletion {
+        request: key,
+        receiver,
+        cancelled,
+        started: Instant::now(),
+    }
+}
+
+fn parse_native_completion_output(output: &[u8]) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let (value, detail) = line.split_once('\t').unwrap_or((line, "command value"));
+            (!value.is_empty() && seen.insert(value.to_owned()))
+                .then(|| (value.to_owned(), detail.to_owned()))
+        })
+        .collect()
+}
+
+fn update_native_completion(running: &mut Option<RunningNativeCompletion>, state: &mut TuiState) {
+    let event = match running.as_ref().map(|task| task.receiver.try_recv()) {
+        Some(Ok(event)) => event,
+        Some(Err(TryRecvError::Disconnected)) => {
+            running.take();
+            state.completion.clear();
+            state.status = "command completion worker stopped unexpectedly".into();
+            return;
+        }
+        Some(Err(TryRecvError::Empty)) | None => return,
+    };
+    let NativeCompletionEvent::Finished(result) = event;
+    let task = running.take().expect("running native completion");
+    let before_cursor = &state.editor.text[..state.editor.cursor];
+    if state.completion_source != CompletionSource::Native || before_cursor != task.request {
+        return;
+    }
+    match result {
+        Ok(candidates) => {
+            state.completion = candidates;
+            state.selected = 0;
+            state.status = if state.completion.is_empty() {
+                "no command completions".into()
+            } else {
+                format!("{} command completions", state.completion.len())
+            };
+        }
+        Err(error) if error == "cancelled" => {}
+        Err(error) => {
+            state.completion.clear();
+            state.status = format!("command completion failed: {error}");
+        }
+    }
+}
+
+fn cancel_native_completion(running: &mut Option<RunningNativeCompletion>) {
+    if let Some(task) = running.take() {
+        task.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 fn complete(shell: &ShellState, state: &mut TuiState) {
     let mut deep_completion = None;
-    complete_with_sources(shell, state, None, &mut deep_completion, &[]);
+    let mut native_completion = None;
+    let commands = InteractiveCommands {
+        resolver: WindowsCommandResolver,
+        aliases: Aliases::new(),
+        path_commands: Vec::new(),
+        completion_providers: HashMap::new(),
+    };
+    complete_with_sources(
+        shell,
+        state,
+        &commands,
+        None,
+        &mut deep_completion,
+        &mut native_completion,
+        &[],
+    );
 }
 
 fn complete_with_sources(
     shell: &ShellState,
     state: &mut TuiState,
+    commands: &InteractiveCommands,
     directory_db: Option<&DirectoryDb>,
     deep_completion: &mut Option<RunningDeepCompletion>,
+    native_completion: &mut Option<RunningNativeCompletion>,
     excluded_directories: &[String],
 ) {
     state.mode = AppMode::Completion;
@@ -1172,7 +1625,9 @@ fn complete_with_sources(
         .to_ascii_lowercase();
     let directories_only = command == "cd";
     let accepts_current_directory = matches!(command.as_str(), "cd" | "ls");
+    let completing_command = token_start == 0;
     if directories_only && token.contains('*') {
+        cancel_native_completion(native_completion);
         state.completion_source = CompletionSource::DeepPath;
         state.completion.clear();
         state.selected = 0;
@@ -1190,23 +1645,60 @@ fn complete_with_sources(
         return;
     }
     cancel_deep_completion(deep_completion);
+
+    if !completing_command {
+        if let Some(request) = native_completion_request(
+            shell,
+            before_cursor,
+            &commands.aliases,
+            &commands.completion_providers,
+        ) {
+            state.completion_source = CompletionSource::Native;
+            state.completion.clear();
+            state.selected = 0;
+            if native_completion.as_ref().map(|task| task.request.as_str())
+                != Some(request.key.as_str())
+            {
+                cancel_native_completion(native_completion);
+                *native_completion = Some(start_native_completion(request));
+            }
+            state.status = "asking command for completions…".into();
+            return;
+        }
+    }
+    cancel_native_completion(native_completion);
     let mut values: Vec<(i64, String, String)> = Vec::new();
 
-    let completing_command = token_start == 0;
     let command_is_path = token.contains(['\\', '/']);
     if completing_command && !command_is_path {
-        values.extend(NAMES.iter().filter_map(|name| {
+        values.extend(commands.aliases.keys().filter_map(|name| {
             fuzzy_score(name, &token)
-                .map(|score| (score as i64, (*name).to_owned(), "builtin".to_owned()))
+                .map(|score| (5_000_000 + score as i64, name.clone(), "alias".to_owned()))
+        }));
+        values.extend(NAMES.iter().filter_map(|name| {
+            fuzzy_score(name, &token).map(|score| {
+                (
+                    4_000_000 + score as i64,
+                    (*name).to_owned(),
+                    "builtin".to_owned(),
+                )
+            })
         }));
         values.extend(TRANSLATED_NAMES.iter().filter_map(|name| {
             fuzzy_score(name, &token).map(|score| {
                 (
-                    score as i64,
+                    3_000_000 + score as i64,
                     (*name).to_owned(),
                     "windows translation".to_owned(),
                 )
             })
+        }));
+        values.extend(command_candidates_in_directory(
+            &shell.cwd, "cwd", 2_000_000, &token,
+        ));
+        values.extend(commands.path_commands.iter().filter_map(|(name, detail)| {
+            fuzzy_score(name, &token)
+                .map(|score| (1_000_000 + score as i64, name.clone(), detail.clone()))
         }));
     } else {
         let expandable_root = matches!(token.as_str(), "~" | "." | "..")
@@ -1300,8 +1792,10 @@ fn complete_with_sources(
             .cmp(&left.0)
             .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
     });
+    let mut seen = HashSet::new();
     state.completion = values
         .into_iter()
+        .filter(|(_, value, _)| seen.insert(value.to_ascii_lowercase()))
         .map(|(_, value, detail)| (value, detail))
         .collect();
     state.selected = 0;
@@ -1504,33 +1998,149 @@ fn should_open_path_completion(state: &TuiState) -> bool {
     )
 }
 
-fn handle_pager_key(state: &mut TuiState, key: KeyEvent) {
+fn copy_transcript_selection(state: &mut TuiState, prompt: &str, width: usize) {
+    let Some(text) = selected_transcript_text(state, prompt, width) else {
+        state.status = "nothing selected".into();
+        return;
+    };
+    copy_selection_text(state, &text);
+}
+
+fn copy_pager_selection(state: &mut TuiState, width: usize) {
+    let Some(text) = selected_pager_text(state, width) else {
+        state.status = "nothing selected".into();
+        return;
+    };
+    copy_selection_text(state, &text);
+}
+
+fn copy_selection_text(state: &mut TuiState, text: &str) {
+    match set_clipboard_text(text) {
+        Ok(()) => {
+            let characters = text.chars().count();
+            state.status = format!("copied {characters} characters");
+        }
+        Err(error) => state.status = format!("cannot copy selection: {error}"),
+    }
+}
+
+fn paste_clipboard(state: &mut TuiState) {
+    match get_clipboard_text() {
+        Ok(Some(text)) => {
+            let text = normalize_pasted_text(&text);
+            if text.is_empty() {
+                state.status = "clipboard has no pasteable text".into();
+                return;
+            }
+            let characters = text.chars().count();
+            state.editor.insert_str(&text);
+            state.status = format!("pasted {characters} characters");
+        }
+        Ok(None) => state.status = "clipboard does not contain text".into(),
+        Err(error) => state.status = format!("cannot paste clipboard: {error}"),
+    }
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_carriage_return = false;
+    for character in text.chars() {
+        match character {
+            '\r' => {
+                normalized.push(' ');
+                previous_was_carriage_return = true;
+            }
+            '\n' if previous_was_carriage_return => previous_was_carriage_return = false,
+            '\n' | '\t' => {
+                normalized.push(' ');
+                previous_was_carriage_return = false;
+            }
+            character if character.is_control() => previous_was_carriage_return = false,
+            character => {
+                normalized.push(character);
+                previous_was_carriage_return = false;
+            }
+        }
+    }
+    normalized
+}
+
+fn scroll_transcript_up(state: &mut TuiState, amount: usize, visible_lines: usize) {
+    let trailing_lines = usize::from(state.mode != AppMode::RunningTask) * 2;
+    if state
+        .output
+        .scroll_up(amount, visible_lines, trailing_lines)
+    {
+        state.flash_scroll_top();
+    }
+}
+
+fn scroll_transcript_down(state: &mut TuiState, amount: usize, visible_lines: usize) {
+    let trailing_lines = usize::from(state.mode != AppMode::RunningTask) * 2;
+    if state
+        .output
+        .scroll_down(amount, visible_lines, trailing_lines)
+    {
+        state.flash_scroll_bottom();
+    }
+}
+
+fn scroll_pager_up(state: &mut TuiState, amount: usize, visible_lines: usize, width: usize) {
+    let maximum = state
+        .pager_visual_line_count(width)
+        .saturating_sub(visible_lines);
+    let Some(pager) = state.pager.as_mut() else {
+        return;
+    };
+    pager.top = pager.top.saturating_sub(amount).min(maximum);
+    let at_top = pager.top == 0;
+    if at_top {
+        state.flash_scroll_top();
+    }
+}
+
+fn scroll_pager_down(state: &mut TuiState, amount: usize, visible_lines: usize, width: usize) {
+    let maximum = state
+        .pager_visual_line_count(width)
+        .saturating_sub(visible_lines);
+    let Some(pager) = state.pager.as_mut() else {
+        return;
+    };
+    pager.top = pager.top.saturating_add(amount).min(maximum);
+    let at_bottom = pager.top == maximum;
+    if at_bottom {
+        state.flash_scroll_bottom();
+    }
+}
+
+fn handle_pager_key(state: &mut TuiState, key: KeyEvent, visible_lines: usize, width: usize) {
     if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+        state.clear_pager_selection();
         state.pager = None;
         state.mode = AppMode::Editing;
         return;
     }
 
-    let Some(pager) = state.pager.as_mut() else {
+    if state.pager.is_none() {
         return;
-    };
+    }
     match key.code {
-        KeyCode::Down | KeyCode::Char('j') => {
-            pager.top = pager
-                .top
-                .saturating_add(1)
-                .min(pager.lines.len().saturating_sub(1));
-        }
-        KeyCode::Up | KeyCode::Char('k') => pager.top = pager.top.saturating_sub(1),
-        KeyCode::PageDown | KeyCode::Char(' ') => {
-            pager.top = pager
-                .top
-                .saturating_add(20)
-                .min(pager.lines.len().saturating_sub(1));
-        }
-        KeyCode::PageUp => pager.top = pager.top.saturating_sub(20),
-        KeyCode::Char('g') => pager.top = 0,
-        KeyCode::Char('G') => pager.top = pager.lines.len().saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => scroll_pager_down(state, 1, visible_lines, width),
+        KeyCode::Up | KeyCode::Char('k') => scroll_pager_up(state, 1, visible_lines, width),
+        KeyCode::PageDown | KeyCode::Char(' ') => scroll_pager_down(
+            state,
+            visible_lines.saturating_sub(1).max(1),
+            visible_lines,
+            width,
+        ),
+        KeyCode::PageUp => scroll_pager_up(
+            state,
+            visible_lines.saturating_sub(1).max(1),
+            visible_lines,
+            width,
+        ),
+        KeyCode::Char('g') => scroll_pager_up(state, usize::MAX, visible_lines, width),
+        KeyCode::Char('G') => scroll_pager_down(state, usize::MAX, visible_lines, width),
         _ => {}
     }
 }
@@ -1538,6 +2148,15 @@ fn handle_pager_key(state: &mut TuiState, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_commands() -> InteractiveCommands {
+        InteractiveCommands {
+            resolver: WindowsCommandResolver,
+            aliases: Aliases::new(),
+            path_commands: Vec::new(),
+            completion_providers: HashMap::new(),
+        }
+    }
 
     #[test]
     fn fuzzy_matching_accepts_non_contiguous_characters() {
@@ -1685,7 +2304,16 @@ mod tests {
         state.editor.set("cd lite".to_owned());
         let mut deep = None;
 
-        complete_with_sources(&shell, &mut state, Some(&db), &mut deep, &[]);
+        let mut native = None;
+        complete_with_sources(
+            &shell,
+            &mut state,
+            &test_commands(),
+            Some(&db),
+            &mut deep,
+            &mut native,
+            &[],
+        );
 
         assert!(state.completion[0].0.starts_with("liteshell-local"));
         assert!(state
@@ -1724,6 +2352,117 @@ mod tests {
     }
 
     #[test]
+    fn empty_command_completion_includes_aliases_cwd_and_path_commands() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("local-tool.exe"), "executable").unwrap();
+        let shell = ShellState::new(root.path().to_owned());
+        let mut state = TuiState::new(100, 4096);
+        let mut commands = test_commands();
+        commands
+            .aliases
+            .insert("work".to_owned(), "just".to_owned());
+        commands
+            .path_commands
+            .push(("just".to_owned(), "PATH executable".to_owned()));
+        let mut deep = None;
+        let mut native = None;
+
+        complete_with_sources(
+            &shell,
+            &mut state,
+            &commands,
+            None,
+            &mut deep,
+            &mut native,
+            &[],
+        );
+
+        assert!(state
+            .completion
+            .iter()
+            .any(|candidate| candidate == &("work".to_owned(), "alias".to_owned())));
+        assert!(state
+            .completion
+            .iter()
+            .any(|candidate| candidate == &("local-tool".to_owned(), "cwd executable".to_owned())));
+        assert!(state
+            .completion
+            .iter()
+            .any(|candidate| candidate == &("just".to_owned(), "PATH executable".to_owned())));
+    }
+
+    #[test]
+    fn native_completion_output_supports_values_with_and_without_help() {
+        let candidates = parse_native_completion_output(
+            b"build\r\n--justfile\tUse a different justfile\r\nbuild\r\n",
+        );
+        assert_eq!(
+            candidates,
+            [
+                ("build".to_owned(), "command value".to_owned()),
+                (
+                    "--justfile".to_owned(),
+                    "Use a different justfile".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pasted_text_is_normalized_to_one_safe_command_line() {
+        assert_eq!(
+            normalize_pasted_text("cargo test\r\njust check\n中文\tvalue\u{1b}"),
+            "cargo test just check 中文 value"
+        );
+    }
+
+    #[test]
+    fn native_completion_request_expands_alias_and_preserves_empty_argument() {
+        let cwd = std::env::current_dir().unwrap();
+        let command_path = resolve("cmd", &cwd).unwrap();
+        let shell = ShellState::new(cwd);
+        let aliases = Aliases::from([("c".to_owned(), "cmd /d".to_owned())]);
+        let providers = HashMap::from([("cmd".to_owned(), "CMD_COMPLETE".to_owned())]);
+
+        let request = native_completion_request(&shell, "c ", &aliases, &providers).unwrap();
+
+        assert_eq!(request.path, command_path);
+        assert_eq!(request.args, ["cmd", "/d", ""]);
+        assert_eq!(request.environment_variable, "CMD_COMPLETE");
+    }
+
+    #[test]
+    fn native_completion_provider_is_called_as_a_bounded_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("completion-provider.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nif \"%TEST_COMPLETE%\"==\"powershell\" (\r\n  echo build\r\n  echo --flag\tFlag help\r\n)\r\n",
+        )
+        .unwrap();
+        let running = start_native_completion(NativeCompletionRequest {
+            key: "provider ".to_owned(),
+            path: script,
+            args: vec!["provider".to_owned(), String::new()],
+            environment_variable: "TEST_COMPLETE".to_owned(),
+            cwd: root.path().to_owned(),
+        });
+
+        let event = running
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let NativeCompletionEvent::Finished(result) = event;
+        assert_eq!(
+            result.unwrap(),
+            [
+                ("build".to_owned(), "command value".to_owned()),
+                ("--flag".to_owned(), "Flag help".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn completed_external_status_stays_out_of_scrollback() {
         let (sender, receiver) = mpsc::channel();
         sender
@@ -1748,6 +2487,25 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].divider);
         assert!(!lines[0].text.contains("status 7"));
+    }
+
+    #[test]
+    fn pager_boundaries_keep_a_full_page_and_trigger_feedback() {
+        let mut state = TuiState::new(100, 4096);
+        state.apply(vec![OutputEvent::Pager {
+            title: "test".to_owned(),
+            lines: (0..20)
+                .map(|index| liteshell_core::StyledLine::plain(index.to_string()))
+                .collect(),
+        }]);
+
+        scroll_pager_down(&mut state, usize::MAX, 5, 80);
+        assert_eq!(state.pager.as_ref().unwrap().top, 15);
+        assert!(state.scroll_flash_active());
+
+        scroll_pager_up(&mut state, usize::MAX, 5, 80);
+        assert_eq!(state.pager.as_ref().unwrap().top, 0);
+        assert!(state.scroll_flash_active());
     }
 
     #[cfg(windows)]

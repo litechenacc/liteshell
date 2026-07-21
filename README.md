@@ -66,8 +66,20 @@ prompt follows the preceding response, matching a conventional shell's continuou
 flow. The two-line prompt follows Starship's default style, completion opens as a
 fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
 statusline occupies the bottom row. Page Up/Down navigate LiteShell's bounded
-transcript. Mouse input remains owned by the terminal, so normal text selection
-and the terminal's native wheel-driven scrollback continue to work.
+transcript, and the mouse wheel navigates the same application-managed
+scrollback. Reaching the oldest or newest full page flashes a small `TOP` or
+`BOTTOM` badge at the corresponding edge. Left-drag selects transcript text
+with a native highlight and copies it to the Windows Unicode clipboard on
+release. Ctrl-C copies the retained selection again, while Esc clears it.
+Right-clicking a retained selection copies and clears it; right-click again to
+paste at the editor cursor. Multiline clipboard text is inserted safely as one
+command line. The built-in pager provides the same selection behavior.
+Command completion includes aliases, builtins, Windows translations, executables
+in the current directory, and executables discovered from `PATH`; pressing Tab on
+an empty prompt therefore opens the complete command catalog. LiteShell also calls
+registered clap dynamic-completion providers in a cancellable background task.
+`just` is registered by default, so `just <Tab>` completes recipes, options, and
+paths from the active justfile without evaluating its PowerShell completion script.
 `cd` completion combines immediate child directories with a frequency-and-recency
 ranked database of previously visited directories. Include `*` in the path token
 to explicitly request a cancellable recursive directory search, for example

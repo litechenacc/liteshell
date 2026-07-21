@@ -9,3 +9,4 @@ crossterm.workspace = true
 liteshell-core = { path = "../liteshell-core" }
 ratatui.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true

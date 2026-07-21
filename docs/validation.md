@@ -52,8 +52,12 @@ exit, valid edited/completed commands, selectable fff candidates, pager traversa
 and Ctrl-C handling.
 
 Prompt and candidate redraw is emitted as one diffed frame. Normal prompt input
-leaves mouse input with the terminal host so scrollback remains available; the
-pager switches modes locally and accepts `MOUSE_WHEELED` events for line scrolling.
+captures mouse-wheel events for application-managed transcript scrolling; the
+pager uses the same wheel events for line scrolling. Left-button drag selection
+is rendered by LiteShell and copied as Unicode text through the Windows clipboard
+API, including reverse, multiline, CJK, and wrapped pager selections.
+Right-click follows terminal-style copy-then-paste behavior, and pasted Unicode
+text is inserted at the editor cursor with line breaks normalized to spaces.
 
 `ssh -V`, `nvim --version`, and `codex --version` were additionally launched from
 LiteShell on the development machine, followed by `pwd`; all returned control to
