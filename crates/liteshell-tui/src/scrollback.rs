@@ -97,12 +97,34 @@ impl Scrollback {
         self.lines.iter()
     }
 
-    pub fn scroll_up(&mut self, amount: usize) {
-        self.offset = (self.offset + amount).min(self.lines.len().saturating_sub(1));
+    /// Move toward the oldest content without allowing the visible window to
+    /// collapse into a partially empty page. `trailing_lines` accounts for the
+    /// active two-line prompt, which is rendered as part of the transcript.
+    /// Returns true when the viewport reaches the oldest available page.
+    pub fn scroll_up(
+        &mut self,
+        amount: usize,
+        visible_lines: usize,
+        trailing_lines: usize,
+    ) -> bool {
+        let total = self.lines.len().saturating_add(trailing_lines);
+        let maximum = total.saturating_sub(visible_lines);
+        self.offset = self.offset.saturating_add(amount).min(maximum);
+        self.offset == maximum
     }
 
-    pub fn scroll_down(&mut self, amount: usize) {
-        self.offset = self.offset.saturating_sub(amount);
+    /// Move toward the newest content. Returns true when the live prompt is in
+    /// view at the bottom of the transcript.
+    pub fn scroll_down(
+        &mut self,
+        amount: usize,
+        visible_lines: usize,
+        trailing_lines: usize,
+    ) -> bool {
+        let total = self.lines.len().saturating_add(trailing_lines);
+        let maximum = total.saturating_sub(visible_lines);
+        self.offset = self.offset.min(maximum).saturating_sub(amount);
+        self.offset == 0
     }
 }
 
@@ -138,5 +160,18 @@ mod tests {
         let lines: Vec<_> = scrollback.lines().collect();
         assert_eq!(lines[0].text, "blue");
         assert_eq!(lines[1].spans[0].style.foreground, SemanticColor::Directory);
+    }
+
+    #[test]
+    fn scrolling_to_top_keeps_a_full_viewport() {
+        let mut scrollback = Scrollback::new(100, 4096);
+        for index in 0..10 {
+            scrollback.push_text(&format!("line {index}\n"), false);
+        }
+
+        assert!(scrollback.scroll_up(usize::MAX, 5, 2));
+        assert_eq!(scrollback.offset, 7);
+        assert!(scrollback.scroll_down(usize::MAX, 5, 2));
+        assert_eq!(scrollback.offset, 0);
     }
 }
