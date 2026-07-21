@@ -38,7 +38,35 @@ environment-variable expansion rules when invoked. An alias may refer to its
 own command name (for example, `alias ls='ls -a'`) without expanding forever.
 
 The file is deliberately data-only. LiteShell reads assignments and alias
-definitions but does not execute startup commands, profiles, or plugins from it.
+definitions but does not execute startup commands, profiles, completion scripts,
+or plugins from it.
+
+## Native command completion
+
+Command-name completion automatically includes aliases, builtins, Windows
+translations, current-directory executables, and executables found on `PATH`.
+The `PATH` catalog is cached at startup; current-directory executables are read
+when completion opens.
+
+`just` dynamic completion is enabled by default. Other commands using clap's
+environment-activated dynamic completion can be registered in `.liteshellrc`:
+
+```text
+complete my-cli clap-env COMPLETE
+```
+
+The first value is the command name and the last is the environment variable
+used by that command's `clap_complete::CompleteEnv` setup. For example, the
+built-in `just` registration is equivalent to:
+
+```text
+complete just clap-env JUST_COMPLETE
+```
+
+LiteShell invokes a registered binary directly with the `powershell` clap
+completion protocol, parses its value-and-description output, and cancels the
+request when the input changes. Calls run in the background with a 500 ms
+timeout. Generated PowerShell completion scripts are never evaluated.
 
 `LITESHELL_DEEP_SEARCH_EXCLUDE_DIRS` controls directory basenames pruned from
 recursive `cd *query` searches. Values are separated by semicolons and matching

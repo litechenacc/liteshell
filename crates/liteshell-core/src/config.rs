@@ -94,12 +94,21 @@ pub enum StartupError {
         #[source]
         source: parser::ParseError,
     },
+    #[error("{path}:{line}: expected complete COMMAND clap-env ENVIRONMENT_VARIABLE")]
+    InvalidCompletion { path: PathBuf, line: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionProviderConfig {
+    pub command: String,
+    pub environment_variable: String,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct StartupConfig {
     pub path: Option<PathBuf>,
     pub aliases: Aliases,
+    pub completions: Vec<CompletionProviderConfig>,
 }
 
 /// Load environment assignments from `~/.liteshellrc` before command
@@ -126,10 +135,21 @@ pub fn load_startup() -> Result<StartupConfig, StartupError> {
         .collect();
     let mut assignments = Vec::new();
     let mut aliases = Aliases::new();
+    let mut completions = Vec::new();
     for (index, source) in contents.lines().enumerate() {
         let line_number = index + 1;
         let mut line = source.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = strip_keyword(line, "complete") {
+            let Some(provider) = parse_completion_provider(value) else {
+                return Err(StartupError::InvalidCompletion {
+                    path,
+                    line: line_number,
+                });
+            };
+            completions.push(provider);
             continue;
         }
         if let Some(alias) = strip_keyword(line, "alias") {
@@ -219,6 +239,7 @@ pub fn load_startup() -> Result<StartupConfig, StartupError> {
     Ok(StartupConfig {
         path: Some(path),
         aliases,
+        completions,
     })
 }
 
@@ -252,6 +273,18 @@ fn valid_alias_name(name: &str) -> bool {
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
+}
+
+fn parse_completion_provider(value: &str) -> Option<CompletionProviderConfig> {
+    let fields: Vec<_> = value.split_whitespace().collect();
+    (fields.len() == 3
+        && fields[1] == "clap-env"
+        && valid_alias_name(fields[0])
+        && valid_environment_name(fields[2]))
+    .then(|| CompletionProviderConfig {
+        command: fields[0].to_owned(),
+        environment_variable: fields[2].to_owned(),
+    })
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -345,5 +378,18 @@ mod startup_tests {
         assert!(valid_alias_name(".."));
         assert!(!valid_alias_name("bad name"));
         assert!(!valid_alias_name("bad=alias"));
+    }
+
+    #[test]
+    fn completion_provider_directives_are_strict_and_data_only() {
+        assert_eq!(
+            parse_completion_provider("just clap-env JUST_COMPLETE"),
+            Some(CompletionProviderConfig {
+                command: "just".to_owned(),
+                environment_variable: "JUST_COMPLETE".to_owned(),
+            })
+        );
+        assert!(parse_completion_provider("just powershell script.ps1").is_none());
+        assert!(parse_completion_provider("bad/name clap-env COMPLETE").is_none());
     }
 }
