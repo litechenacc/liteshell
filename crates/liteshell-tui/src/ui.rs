@@ -153,7 +153,7 @@ fn draw_transcript(
     if show_prompt && start <= history_len + 1 && history_len + 1 < end {
         prompt_row = Some(area.y + items.len() as u16);
         item_widths.push(2 + state.editor.text.width());
-        items.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 "❯ ",
                 Style::default()
@@ -165,7 +165,18 @@ fn draw_transcript(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(state.editor.text.clone()),
-        ])));
+        ];
+        if let Some(hint) = state.history_hint.as_ref() {
+            if let Some(suffix) = hint.strip_prefix(&state.editor.text) {
+                spans.push(Span::styled(
+                    suffix.to_owned(),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
 
     frame.render_widget(List::new(items), area);
@@ -582,6 +593,28 @@ mod tests {
                     text
                 });
         assert!(rendered.contains("fuzzy search"));
+    }
+
+    #[test]
+    fn history_hint_is_rendered_after_editor_text() {
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("git s".into());
+        state.history_hint = Some("git status".into());
+
+        terminal
+            .draw(|frame| draw(frame, &state, "C:\\work\n❯ ", 0, false))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("❯ git status"));
     }
 
     #[test]

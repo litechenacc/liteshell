@@ -63,8 +63,10 @@ has detailed help through `<command> --help` or `help <command>`.
 Interactive mode uses a plain-text, bounded transcript with a divider between
 command/response groups. The first prompt begins at the top and each subsequent
 prompt follows the preceding response, matching a conventional shell's continuous
-flow. The two-line prompt follows Starship's default style, completion opens as a
-fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
+flow. The two-line prompt follows Starship's default style. As you type, the most
+recent matching history entry appears as an inline hint; Right Arrow accepts it,
+while Tab continues to open regular completion. Completion opens as a fuzzy-search overlay,
+Ctrl-R provides fuzzy history search seeded with the current input, and a persistent
 statusline occupies the bottom row. Page Up/Down navigate LiteShell's bounded
 transcript, and the mouse wheel navigates the same application-managed
 scrollback. Reaching the oldest or newest full page flashes a small `TOP` or

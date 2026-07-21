@@ -344,6 +344,7 @@ fn interactive(
         update_running_external(&mut running.external, &mut state, &mut shell.last_status);
         update_deep_completion(&mut running.deep_completion, &mut state);
         update_native_completion(&mut running.native_completion, &mut state);
+        refresh_history_hint(history.entries(), &mut state);
         if let Some(task) = running.search.as_ref() {
             let frame = (task.started.elapsed().as_millis() / 80) as usize % SPINNER.len();
             state.status = format!(
@@ -378,6 +379,10 @@ fn interactive(
             state.status = format!("{} asking command for completions…", SPINNER[frame]);
         }
 
+        // Ratatui flushes changed cells before restoring the requested cursor
+        // position. Hide it during that flush so inline hints do not make the
+        // hardware cursor visibly jump to the end of the ghost text.
+        terminal.terminal().hide_cursor()?;
         terminal.terminal().draw(|frame| {
             draw(
                 frame,
@@ -481,10 +486,7 @@ fn interactive(
                         state.output.clear();
                     }
                     KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.mode = AppMode::Completion;
-                        state.completion_source = CompletionSource::History;
-                        state.completion_query.clear();
-                        refresh_history_completion(history.entries(), &mut state);
+                        open_history_completion(history.entries(), &mut state);
                     }
                     KeyCode::Char(character) => {
                         state.clear_transcript_selection();
@@ -573,6 +575,9 @@ fn interactive(
                         }
                     }
                     KeyCode::Right => {
+                        if accept_history_hint(&mut state) {
+                            continue;
+                        }
                         if !(state.mode == AppMode::Completion
                             && state.completion_source == CompletionSource::History)
                         {
@@ -1944,6 +1949,39 @@ fn refresh_history_completion(entries: &[String], state: &mut TuiState) {
     state.selected = 0;
 }
 
+fn open_history_completion(entries: &[String], state: &mut TuiState) {
+    state.completion_query = state.editor.text.clone();
+    refresh_history_completion(entries, state);
+}
+
+fn refresh_history_hint(entries: &[String], state: &mut TuiState) {
+    state.history_hint = if state.mode == AppMode::Editing
+        && state.editor.cursor == state.editor.text.len()
+        && !state.editor.text.is_empty()
+    {
+        entries
+            .iter()
+            .rev()
+            .find(|command| {
+                command.len() > state.editor.text.len() && command.starts_with(&state.editor.text)
+            })
+            .cloned()
+    } else {
+        None
+    };
+}
+
+fn accept_history_hint(state: &mut TuiState) -> bool {
+    if state.mode != AppMode::Editing || state.editor.cursor != state.editor.text.len() {
+        return false;
+    }
+    let Some(hint) = state.history_hint.take() else {
+        return false;
+    };
+    state.editor.set(hint);
+    true
+}
+
 fn accept_completion(shell: &ShellState, state: &mut TuiState) {
     if let Some((value, detail)) = state.completion.get(state.selected).cloned() {
         if state.completion_source == CompletionSource::History {
@@ -2180,6 +2218,49 @@ mod tests {
         state.completion_query = "pd".to_owned();
         refresh_history_completion(&entries, &mut state);
         assert_eq!(state.completion[0].0, "pwd");
+    }
+
+    #[test]
+    fn history_hint_uses_the_most_recent_prefix_match() {
+        let entries = vec![
+            "git stash".to_owned(),
+            "git status --short".to_owned(),
+            "git status".to_owned(),
+        ];
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("git s".to_owned());
+
+        refresh_history_hint(&entries, &mut state);
+
+        assert_eq!(state.history_hint.as_deref(), Some("git status"));
+
+        state.editor.left();
+        refresh_history_hint(&entries, &mut state);
+        assert_eq!(state.history_hint, None);
+    }
+
+    #[test]
+    fn right_arrow_accepts_the_history_hint_at_the_end_of_input() {
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("git s".to_owned());
+        state.history_hint = Some("git status".to_owned());
+
+        assert!(accept_history_hint(&mut state));
+        assert_eq!(state.editor.text, "git status");
+        assert_eq!(state.editor.cursor, "git status".len());
+        assert_eq!(state.history_hint, None);
+    }
+
+    #[test]
+    fn history_search_starts_with_the_current_editor_text() {
+        let entries = vec!["git status".to_owned(), "cargo test".to_owned()];
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("gst".to_owned());
+
+        open_history_completion(&entries, &mut state);
+
+        assert_eq!(state.completion_query, "gst");
+        assert_eq!(state.completion[0].0, "git status");
     }
 
     #[test]
