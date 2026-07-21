@@ -1,10 +1,71 @@
 use liteshell_builtins::CommandResolver;
 use std::{
     ffi::OsStr,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
 use thiserror::Error;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+};
+
+/// A Windows Job Object that terminates attached process trees when LiteShell
+/// exits or is killed by a terminal-tool timeout.
+pub struct ProcessJob {
+    handle: HANDLE,
+}
+
+impl ProcessJob {
+    pub fn kill_on_close() -> std::io::Result<Self> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error);
+        }
+        Ok(Self { handle })
+    }
+
+    pub fn assign(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let assigned =
+            unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
 
 pub const TRANSLATED_NAMES: &[&str] = &["ps", "kill"];
 
@@ -26,6 +87,20 @@ pub struct WindowsCommandResolver;
 // Prefer Windows-native command formats over extensionless Unix shims. Scoop,
 // for example, installs `scoop`, `scoop.cmd`, and `scoop.ps1` side by side.
 const EXTS: &[&str] = &["exe", "com", "cmd", "bat", "ps1", ""];
+
+pub fn is_supported_executable(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(|extension| {
+                EXTS[..EXTS.len() - 1]
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
+            .unwrap_or(true)
+}
+
 impl CommandResolver for WindowsCommandResolver {
     fn resolve(&self, command: &str, cwd: &Path) -> Option<PathBuf> {
         resolve(translated_target(command).unwrap_or(command), cwd)
@@ -108,7 +183,18 @@ fn translate_ps(args: &[String], cwd: &Path) -> Result<TranslatedCommand, Transl
         translated.push(if query.parse::<u32>().is_ok() {
             format!("PID eq {query}")
         } else {
-            format!("IMAGENAME eq *{query}*")
+            let pattern = if query.ends_with('*') {
+                query.to_owned()
+            } else {
+                format!("{query}*")
+            };
+            if pattern[..pattern.len() - 1].contains('*') {
+                return translation_usage(
+                    "ps",
+                    "wildcards are only supported at the end of a name",
+                );
+            }
+            format!("IMAGENAME eq {pattern}")
         });
     }
     translated_command("ps", "tasklist.exe", translated, cwd)
@@ -245,7 +331,7 @@ pub fn quote_windows_argument(value: &OsStr) -> String {
     out
 }
 pub fn launch(path: &Path, args: &[String], cwd: &Path) -> std::io::Result<i32> {
-    let status = command(path, args, cwd)
+    let status = build_command(path, args, cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -254,7 +340,7 @@ pub fn launch(path: &Path, args: &[String], cwd: &Path) -> std::io::Result<i32> 
 }
 
 pub fn spawn_captured(path: &Path, args: &[String], cwd: &Path) -> std::io::Result<Child> {
-    command(path, args, cwd)
+    build_command(path, args, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -275,15 +361,29 @@ pub fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
     }
 }
 
-fn command(path: &Path, args: &[String], cwd: &Path) -> Command {
+/// Construct a process command using LiteShell's normal Windows routing rules.
+/// Callers may attach custom stdio before spawning it, which is required by the
+/// pipeline executor.
+pub fn build_command(path: &Path, args: &[String], cwd: &Path) -> Command {
     let ext = path
         .extension()
         .and_then(OsStr::to_str)
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut c = if matches!(ext.as_str(), "cmd" | "bat") {
+        // `cmd /c` does not accept the script path and its arguments as an
+        // argv-style tail. In particular, passing a path such as
+        // `C:\Program Files\...\code.cmd` as a separate argument makes cmd
+        // try to execute `C:\Program`. Build one command string and surround
+        // the whole string with the extra quotes required by `/s /c`.
+        let mut command_line = quote_windows_argument(path.as_os_str());
+        for argument in args {
+            command_line.push(' ');
+            command_line.push_str(&quote_windows_argument(OsStr::new(argument)));
+        }
         let mut c = Command::new("cmd.exe");
-        c.args(["/d", "/s", "/c"]).arg(path).args(args);
+        c.args(["/d", "/s", "/c"])
+            .raw_arg(format!("\"{command_line}\""));
         c
     } else if ext == "ps1" {
         let shell = resolve("pwsh.exe", cwd)
@@ -356,9 +456,47 @@ mod tests {
         .unwrap()
         .wait_with_output()
         .unwrap();
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("out"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("err"));
+    }
+
+    #[test]
+    fn batch_file_with_spaces_in_its_path_is_invoked_as_one_command() {
+        let directory = std::env::temp_dir().join(format!(
+            "liteshell batch path {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("print argument.cmd");
+        std::fs::write(&script, "@echo off\r\necho [%~1]\r\n").unwrap();
+
+        let output = spawn_captured(
+            &script,
+            &["hello world".to_owned()],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("[hello world]"));
     }
 
     #[test]
@@ -370,9 +508,38 @@ mod tests {
         .unwrap();
         assert_eq!(
             command.args,
-            ["/fo", "table", "/v", "/fi", "IMAGENAME eq *code*"]
+            ["/fo", "table", "/v", "/fi", "IMAGENAME eq code*"]
         );
         assert_eq!(command.path.file_name().unwrap(), "tasklist.exe");
+    }
+
+    #[test]
+    fn ps_executable_name_uses_a_tasklist_compatible_prefix_filter() {
+        let command = translate_ps(
+            &["chrome.exe".to_owned()],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            command.args,
+            ["/fo", "table", "/fi", "IMAGENAME eq chrome.exe*"]
+        );
+    }
+
+    #[test]
+    fn translated_ps_name_filter_is_accepted_by_tasklist() {
+        let cwd = std::env::current_dir().unwrap();
+        let command = translate_ps(&["liteshell-no-such-process".to_owned()], &cwd).unwrap();
+        let output = spawn_captured(&command.path, &command.args, &cwd)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("search filter"));
     }
 
     #[test]

@@ -1,7 +1,5 @@
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
-};
-use liteshell_builtins::{dispatch, Context, NAMES};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use liteshell_builtins::{dispatch, overview_text, version_text, Context, NAMES};
 use liteshell_core::{
     config::{directory_db_path, history_path, load_startup, Config},
     directory_db::{frecency, now_epoch, DirectoryDb},
@@ -12,8 +10,8 @@ use liteshell_core::{
 use liteshell_fff::FffSearch;
 use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
 use liteshell_windows::{
-    launch, resolve, spawn_captured, terminate_process_tree, translate, WindowsCommandResolver,
-    TRANSLATED_NAMES,
+    is_supported_executable, launch, resolve, spawn_captured, terminate_process_tree, translate,
+    WindowsCommandResolver, TRANSLATED_NAMES,
 };
 use std::{
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
@@ -25,6 +23,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+mod executor;
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const DIRECTORY_DB_FLUSH_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -80,19 +80,104 @@ struct InteractiveCommands {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("liteshell: {error}");
-        std::process::exit(1);
+    match run() {
+        Ok(0) => {}
+        Ok(status) => std::process::exit(status),
+        Err(error) => {
+            eprintln!("liteshell: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+enum Invocation {
+    Auto { statusline: bool },
+    Command { line: String, pipefail: bool },
+    Help,
+    Version,
+}
+
+fn invocation() -> Result<Invocation, String> {
+    let mut args = std::env::args().skip(1);
+    let mut command = None;
+    let mut pipefail = true;
+    let mut statusline = true;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "-c" | "--command" => {
+                if command.is_some() {
+                    return Err("command may only be supplied once".into());
+                }
+                command = Some(
+                    args.next()
+                        .ok_or_else(|| format!("{argument} requires a command string"))?,
+                );
+            }
+            "--pipefail" => pipefail = true,
+            "--no-pipefail" => pipefail = false,
+            "--status-line=auto" | "--status-line=on" => statusline = true,
+            "--status-line=off" | "--no-status-line" => statusline = false,
+            "--status-line" => {
+                statusline = match args.next().as_deref() {
+                    Some("auto" | "on") => true,
+                    Some("off") => false,
+                    Some(value) => {
+                        return Err(format!(
+                            "invalid status-line value: {value}; expected auto, on, or off"
+                        ))
+                    }
+                    None => return Err("--status-line requires auto, on, or off".into()),
+                };
+            }
+            "-h" | "--help" => return Ok(Invocation::Help),
+            "-V" | "--version" => return Ok(Invocation::Version),
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok(match command {
+        Some(line) => Invocation::Command { line, pipefail },
+        None => Invocation::Auto { statusline },
+    })
+}
+
+fn print_help() {
+    print!("{}", overview_text());
+}
+
+fn run() -> Result<i32, Box<dyn std::error::Error>> {
+    let invocation =
+        invocation().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if matches!(invocation, Invocation::Help) {
+        print_help();
+        return Ok(0);
+    }
+    if matches!(invocation, Invocation::Version) {
+        print!("{}", version_text());
+        return Ok(0);
+    }
     let startup = load_startup()?;
-    let shell = ShellState::new(std::env::current_dir()?);
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        interactive(shell, startup.aliases)
-    } else {
-        plain(shell, startup.aliases)
+    let mut shell = ShellState::new(std::env::current_dir()?);
+    match invocation {
+        Invocation::Command { line, pipefail } => {
+            let command_line =
+                match parser::parse_command_line_with_aliases(&line, &startup.aliases) {
+                    Ok(command_line) => command_line,
+                    Err(error) => {
+                        eprintln!("parse: {error}");
+                        return Ok(2);
+                    }
+                };
+            Ok(executor::execute(&command_line, &mut shell, pipefail))
+        }
+        Invocation::Auto { statusline }
+            if io::stdin().is_terminal() && io::stdout().is_terminal() =>
+        {
+            interactive(shell, startup.aliases, statusline)?;
+            Ok(0)
+        }
+        Invocation::Auto { .. } => plain(shell, startup.aliases),
+        Invocation::Help => unreachable!(),
+        Invocation::Version => unreachable!(),
     }
 }
 
@@ -126,7 +211,7 @@ impl OutputSink for PlainOutput {
     }
 }
 
-fn plain(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::error::Error>> {
+fn plain(mut shell: ShellState, aliases: Aliases) -> Result<i32, Box<dyn std::error::Error>> {
     let resolver = WindowsCommandResolver;
     let mut output = PlainOutput;
     let config = Config::default();
@@ -143,6 +228,7 @@ fn plain(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::err
             Ok(arguments) => arguments,
             Err(error) => {
                 eprintln!("parse: {error}");
+                shell.last_status = 2;
                 continue;
             }
         };
@@ -155,6 +241,7 @@ fn plain(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::err
         let result = {
             let mut context = Context {
                 shell: &mut shell,
+                input: &mut io::empty(),
                 output: &mut output,
                 search: &mut search,
                 resolver: &resolver,
@@ -194,10 +281,14 @@ fn plain(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::err
 
     let _ = history.save();
     directory_db.flush()?;
-    Ok(())
+    Ok(shell.last_status)
 }
 
-fn interactive(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::error::Error>> {
+fn interactive(
+    mut shell: ShellState,
+    aliases: Aliases,
+    show_statusline: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();
     let mut history = History::new(history_path(), config.history_capacity);
     let _ = history.load();
@@ -251,9 +342,15 @@ fn interactive(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn st
             state.status = format!("{} searching directories…", SPINNER[frame]);
         }
 
-        terminal
-            .terminal()
-            .draw(|frame| draw(frame, &state, &shell.prompt(), shell.last_status))?;
+        terminal.terminal().draw(|frame| {
+            draw(
+                frame,
+                &state,
+                &shell.prompt(),
+                shell.last_status,
+                show_statusline,
+            )
+        })?;
 
         let wait = if running.search.is_some()
             || running.external.is_some()
@@ -517,11 +614,6 @@ fn interactive(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn st
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => state.output.scroll_up(3),
-                MouseEventKind::ScrollDown => state.output.scroll_down(3),
-                _ => {}
-            },
             _ => {}
         }
     }
@@ -543,16 +635,42 @@ fn execute_interactive(
     state
         .output
         .push_text(&format!("{}{}\n", shell.prompt(), line), false);
-    let arguments = match parser::parse_with_aliases(line, &commands.aliases) {
-        Ok(arguments) => arguments,
+    let command_line = match parser::parse_command_line_with_aliases(line, &commands.aliases) {
+        Ok(command_line) => command_line,
         Err(error) => {
             state.output.push_text(&format!("parse: {error}\n"), true);
+            shell.last_status = 2;
             state.output.push_divider();
             return Ok(());
         }
     };
+    let compound = command_line.pipelines.len() != 1
+        || command_line.pipelines[0].1.commands.len() != 1
+        || !command_line.pipelines[0].1.commands[0]
+            .redirections
+            .is_empty();
+    if compound {
+        state.mode = AppMode::RunningChild;
+        let result = executor::execute_captured(&command_line, shell, true)?;
+        shell.last_status = result.status;
+        if !result.stdout.is_empty() {
+            state
+                .output
+                .push_text(&String::from_utf8_lossy(&result.stdout), false);
+        }
+        if !result.stderr.is_empty() {
+            state
+                .output
+                .push_text(&String::from_utf8_lossy(&result.stderr), true);
+        }
+        state.mode = AppMode::Editing;
+        state.output.push_divider();
+        return Ok(());
+    }
+    let arguments = command_line.pipelines[0].1.commands[0].args.clone();
 
-    if matches!(arguments[0].to_ascii_lowercase().as_str(), "find" | "rg") {
+    let detailed_help = arguments.len() == 2 && matches!(arguments[1].as_str(), "-h" | "--help");
+    if !detailed_help && matches!(arguments[0].to_ascii_lowercase().as_str(), "find" | "rg") {
         if arguments[0].eq_ignore_ascii_case("rg") && arguments.len() < 2 {
             state
                 .output
@@ -575,6 +693,7 @@ fn execute_interactive(
     let result = {
         let mut context = Context {
             shell,
+            input: &mut io::empty(),
             output: &mut events,
             search,
             resolver: &commands.resolver,
@@ -627,11 +746,6 @@ fn execute_interactive(
         }
     };
     shell.last_status = status;
-
-    state.output.push_text(
-        &format!("[child exited with status {status}]\n"),
-        status != 0,
-    );
     state.mode = AppMode::Editing;
     state.output.push_divider();
     Ok(())
@@ -799,10 +913,6 @@ fn update_running_external(
     if let Some(status) = finished {
         let task = running.take().expect("running external command");
         *last_status = status;
-        state.output.push_text(
-            &format!("[child exited with status {status}]\n"),
-            status != 0,
-        );
         state.output.push_divider();
         state.mode = AppMode::Editing;
         state.status = format!(
@@ -1082,7 +1192,9 @@ fn complete_with_sources(
     cancel_deep_completion(deep_completion);
     let mut values: Vec<(i64, String, String)> = Vec::new();
 
-    if token_start == 0 {
+    let completing_command = token_start == 0;
+    let command_is_path = token.contains(['\\', '/']);
+    if completing_command && !command_is_path {
         values.extend(NAMES.iter().filter_map(|name| {
             fuzzy_score(name, &token)
                 .map(|score| (score as i64, (*name).to_owned(), "builtin".to_owned()))
@@ -1130,6 +1242,9 @@ fn complete_with_sources(
                 if directories_only && !is_directory {
                     continue;
                 }
+                if completing_command && !is_directory && !is_supported_executable(&entry.path()) {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let Some(score) = fuzzy_score(&name, query) else {
                     continue;
@@ -1138,6 +1253,8 @@ fn complete_with_sources(
                 let detail = if is_directory {
                     value.push('\\');
                     "directory"
+                } else if completing_command {
+                    "executable"
                 } else {
                     "file"
                 };
@@ -1513,6 +1630,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_current_directory_completes_executable_commands() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("tools")).unwrap();
+        std::fs::write(root.path().join("runner.exe"), "executable").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not executable").unwrap();
+        let shell = ShellState::new(root.path().to_owned());
+        let mut state = TuiState::new(100, 4096);
+        state.editor.set("./".to_owned());
+
+        complete(&shell, &mut state);
+
+        assert!(state
+            .completion
+            .iter()
+            .any(|(value, detail)| value == ".\\runner.exe" && detail == "executable"));
+        assert!(state
+            .completion
+            .iter()
+            .any(|(value, detail)| value == ".\\tools\\" && detail == "directory"));
+        assert!(!state
+            .completion
+            .iter()
+            .any(|(value, _)| value.contains("notes.txt")));
+    }
+
+    #[test]
     fn terminal_programs_are_kept_out_of_captured_mode() {
         assert!(requires_terminal(
             Path::new(r"C:\tools\nvim.exe"),
@@ -1578,6 +1721,33 @@ mod tests {
             &events[1],
             ExternalTaskEvent::Output { text, error: true } if text == "second"
         ));
+    }
+
+    #[test]
+    fn completed_external_status_stays_out_of_scrollback() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(ExternalTaskEvent::Finished { status: 7 })
+            .unwrap();
+        let mut running = Some(RunningExternal {
+            command: "example".to_owned(),
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+        });
+        let mut state = TuiState::new(100, 4096);
+        state.mode = AppMode::RunningTask;
+        let mut last_status = 0;
+
+        update_running_external(&mut running, &mut state, &mut last_status);
+
+        assert_eq!(last_status, 7);
+        assert!(running.is_none());
+        assert_eq!(state.mode, AppMode::Editing);
+        let lines: Vec<_> = state.output.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].divider);
+        assert!(!lines[0].text.contains("status 7"));
     }
 
     #[cfg(windows)]

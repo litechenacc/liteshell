@@ -1,4 +1,7 @@
 mod color;
+mod help;
+
+pub use help::{command_text as command_help_text, overview_text, version_text, VERSION};
 
 use color::{file_color, highlight_lines, highlight_text, span, strong};
 use liteshell_core::{
@@ -15,7 +18,7 @@ use std::{
 
 pub const NAMES: &[&str] = &[
     "cd", "pwd", "ls", "mkdir", "rm", "touch", "cat", "tail", "less", "clear", "which", "find",
-    "rg", "help", "exit", "quit",
+    "rg", "help", "version", "exit", "quit",
 ];
 pub trait CommandResolver {
     fn resolve(&self, command: &str, cwd: &Path) -> Option<PathBuf>;
@@ -27,6 +30,9 @@ pub trait CommandResolver {
 }
 pub struct Context<'a> {
     pub shell: &'a mut ShellState,
+    /// Standard input for the command. Agent/pipeline execution supplies the
+    /// inherited handle or preceding stage's pipe.
+    pub input: &'a mut dyn Read,
     pub output: &'a mut dyn OutputSink,
     pub search: &'a mut dyn SearchProvider,
     pub resolver: &'a dyn CommandResolver,
@@ -52,6 +58,12 @@ pub fn dispatch(args: &[String], ctx: &mut Context<'_>) -> CommandResult {
         return CommandResult::ok();
     }
     let cmd = args[0].to_ascii_lowercase();
+    if args.len() == 2 && matches!(args[1].as_str(), "-h" | "--help") {
+        if let Some(text) = help::command_text(&cmd) {
+            emit(ctx, text);
+            return CommandResult::ok();
+        }
+    }
     match cmd.as_str() {
         "exit" | "quit" => {
             if args.len() != 1 {
@@ -74,8 +86,19 @@ pub fn dispatch(args: &[String], ctx: &mut Context<'_>) -> CommandResult {
         "find" => search(args, ctx, false),
         "rg" => search(args, ctx, true),
         "help" => help(args, ctx),
+        "version" => version(args, ctx),
+        "ps" | "kill" => CommandResult::unhandled(),
         _ => CommandResult::unhandled(),
     }
+}
+
+pub fn handles(args: &[String]) -> bool {
+    args.first().is_some_and(|command| {
+        NAMES.iter().any(|name| name.eq_ignore_ascii_case(command))
+            || (matches!(command.to_ascii_lowercase().as_str(), "ps" | "kill")
+                && args.len() == 2
+                && matches!(args[1].as_str(), "-h" | "--help"))
+    })
 }
 
 fn mkdir(a: &[String], c: &mut Context<'_>) -> CommandResult {
@@ -121,6 +144,10 @@ fn rm(a: &[String], c: &mut Context<'_>) -> CommandResult {
     for value in &a[1..] {
         if !end && value == "--" {
             end = true;
+        } else if !end && value == "--force" {
+            force = true;
+        } else if !end && value == "--recursive" {
+            recursive = true;
         } else if !end && value.starts_with('-') && value.len() > 1 {
             for option in value[1..].chars() {
                 match option {
@@ -273,6 +300,10 @@ fn ls(a: &[String], c: &mut Context<'_>) -> CommandResult {
     for x in &a[1..] {
         if !end && x == "--" {
             end = true
+        } else if !end && x == "--all" {
+            all = true
+        } else if !end && x == "--long" {
+            long = true
         } else if !end && x.starts_with('-') && x.len() > 1 {
             for o in x[1..].chars() {
                 match o {
@@ -370,8 +401,18 @@ fn read_text(path: &Path) -> Result<String, String> {
     String::from_utf8(b).map_err(|_| "file is not valid UTF-8".into())
 }
 fn cat(a: &[String], c: &mut Context<'_>) -> CommandResult {
-    if a.len() < 2 {
-        return usage(c, "cat", "expected at least one file");
+    if a.len() == 1 {
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = match c.input.read(&mut buffer) {
+                Ok(0) => return CommandResult::ok(),
+                Ok(count) => count,
+                Err(failure) => return error(c, "cat", failure.to_string(), 1),
+            };
+            if let Err(failure) = c.output.write_stdout(&buffer[..count]) {
+                return error(c, "cat", failure.to_string(), 1);
+            }
+        }
     }
     let mut status = 0;
     for p in &a[1..] {
@@ -521,46 +562,22 @@ fn search(a: &[String], c: &mut Context<'_>, grep: bool) -> CommandResult {
     }
 }
 fn help(a: &[String], c: &mut Context<'_>) -> CommandResult {
+    let text = match a {
+        [_] => help::overview_text(),
+        [_, command] => match help::command_text(command) {
+            Some(text) => text,
+            None => return usage(c, "help", &format!("unknown command: {command}")),
+        },
+        _ => return usage(c, "help", "expected zero or one command"),
+    };
+    emit(c, text);
+    CommandResult::ok()
+}
+
+fn version(a: &[String], c: &mut Context<'_>) -> CommandResult {
     if a.len() != 1 {
-        return usage(c, "help", "expected no arguments");
+        return usage(c, "version", "expected no arguments");
     }
-    let commands = [
-        ("cd", " [path]", "change directory (no path uses home)"),
-        ("pwd", "", "print current directory"),
-        ("ls", " [-a] [-l] [path]", "list directory contents"),
-        ("mkdir", " [-p] directory...", "create directories"),
-        ("rm", " [-f] [-r] path...", "remove files or directories"),
-        ("touch", " file...", "create files or update timestamps"),
-        ("cat", " file...", "print UTF-8 text files"),
-        ("tail", " [-n count] file", "print the last lines"),
-        ("less", " file", "open the built-in pager"),
-        ("clear", "", "clear the terminal"),
-        ("which", " command...", "resolve commands"),
-        ("find", " [query]", "fuzzy file search"),
-        ("rg", " query", "indexed content search"),
-        (
-            "ps",
-            " [aux|-aux] [name|pid]",
-            "list/filter processes (Windows translation)",
-        ),
-        (
-            "kill",
-            " [-s TERM|KILL] [--tree] pid...",
-            "end processes (Windows translation)",
-        ),
-        ("exit", "", "leave LiteShell"),
-    ];
-    let mut spans = vec![
-        strong("LiteShell commands", Color::Heading),
-        StyledSpan::plain(":\n"),
-    ];
-    for (command, arguments, description) in commands {
-        spans.push(StyledSpan::plain("  "));
-        spans.push(strong(command, Color::Command));
-        spans.push(span(format!("{arguments:<20}"), Color::Option));
-        spans.push(StyledSpan::plain(description));
-        spans.push(StyledSpan::plain("\n"));
-    }
-    emit_styled(c, spans);
+    emit(c, help::version_text());
     CommandResult::ok()
 }

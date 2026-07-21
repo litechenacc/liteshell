@@ -47,7 +47,13 @@ fn styled_line(line: &StyledLine) -> Line<'static> {
     )
 }
 
-pub fn draw(frame: &mut Frame, state: &TuiState, prompt: &str, last_status: i32) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &TuiState,
+    prompt: &str,
+    last_status: i32,
+    show_statusline: bool,
+) {
     if state.mode == AppMode::Pager {
         draw_pager(frame, state);
         return;
@@ -55,11 +61,17 @@ pub fn draw(frame: &mut Frame, state: &TuiState, prompt: &str, last_status: i32)
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints(if show_statusline {
+            vec![Constraint::Min(1), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Min(1), Constraint::Length(0)]
+        })
         .split(frame.area());
 
     let prompt_row = draw_transcript(frame, state, prompt, last_status, chunks[0]);
-    draw_statusline(frame, state, prompt, last_status, chunks[1]);
+    if show_statusline {
+        draw_statusline(frame, state, prompt, last_status, chunks[1]);
+    }
 
     if !state.completion.is_empty() {
         if let Some(prompt_row) = prompt_row {
@@ -346,9 +358,27 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let state = TuiState::new(100, 4096);
         terminal
-            .draw(|frame| draw(frame, &state, "C:\\work\n❯ ", 0))
+            .draw(|frame| draw(frame, &state, "C:\\work\n❯ ", 0, true))
             .unwrap();
         assert_eq!(terminal.backend().buffer().area.width, 24);
+    }
+
+    #[test]
+    fn statusline_can_be_hidden_without_reserving_a_row() {
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = TuiState::new(100, 4096);
+        terminal
+            .draw(|frame| draw(frame, &state, "C:\\work\n❯ ", 0, false))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Tab: complete"));
     }
 
     #[test]
@@ -358,7 +388,7 @@ mod tests {
         let mut state = TuiState::new(100, 4096);
         state.completion.push(("README.md".into(), "file".into()));
         terminal
-            .draw(|frame| draw(frame, &state, "~\\work\n❯ ", 0))
+            .draw(|frame| draw(frame, &state, "~\\work\n❯ ", 0, true))
             .unwrap();
         let rendered =
             terminal

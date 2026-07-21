@@ -19,7 +19,19 @@ required.
 just build
 just test
 just release
+just install
 ```
+
+`just install` builds the release executable and a small stable launcher. The
+launcher is installed as `~/.local/bin/liteshell.exe`; immutable shell builds
+are stored below `~/.local/bin/.liteshell/versions/<sha256>/`. Installation
+switches a small `current` file atomically, so existing instances keep running
+their old build while the next invocation immediately uses the new one.
+
+On the first install over an older standalone `liteshell.exe`, the installer
+moves the running executable into `.liteshell/legacy` before placing the
+launcher. Windows lets the existing process continue from its renamed file.
+The launcher removes obsolete migration files once they are no longer in use.
 
 Equivalent Cargo commands are:
 
@@ -44,13 +56,18 @@ Cargo build script.
 cargo run -p liteshell
 ```
 
+Use `liteshell --version` for build version information and `liteshell --help`
+for the tabular command overview. Every builtin and Windows-translated command
+has detailed help through `<command> --help` or `help <command>`.
+
 Interactive mode uses a plain-text, bounded transcript with a divider between
 command/response groups. The first prompt begins at the top and each subsequent
 prompt follows the preceding response, matching a conventional shell's continuous
 flow. The two-line prompt follows Starship's default style, completion opens as a
 fuzzy-search overlay, Ctrl-R provides fuzzy history search, and a persistent
-statusline occupies the bottom row. Page Up/Down and the mouse wheel navigate the
-transcript.
+statusline occupies the bottom row. Page Up/Down navigate LiteShell's bounded
+transcript. Mouse input remains owned by the terminal, so normal text selection
+and the terminal's native wheel-driven scrollback continue to work.
 `cd` completion combines immediate child directories with a frequency-and-recency
 ranked database of previously visited directories. Include `*` in the path token
 to explicitly request a cancellable recursive directory search, for example
@@ -66,6 +83,27 @@ without terminal initialization or ANSI escapes:
 ```text
 (echo pwd& echo exit) | target\release\liteshell.exe
 ```
+
+For terminal tools and agents, command mode executes one command string while
+leaving standard input available to the command. It loads the same
+`~/.liteshellrc`, environment, aliases, working-directory rules, builtins, and
+Windows command resolver as the interactive shell:
+
+```text
+liteshell.exe -c "rg TODO crates | cat"
+```
+
+Command mode never emits a prompt, status line, divider, ANSI escape, or TUI
+frame. Pipelines use concurrent anonymous OS pipes and may mix builtins with
+external programs. Supported operators are `|`, `<`, `>`, `>>`, `2>`, `2>>`,
+`2>&1`, `&&`, `||`, and `;`. Pipeline failures use `pipefail` semantics by
+default so an earlier failed stage is visible to automation; pass
+`--no-pipefail` for last-stage-only status. External stages are attached to a
+kill-on-close Windows Job Object so terminal-tool timeouts do not leave process
+trees behind.
+
+The interactive status line defaults to `auto`/on and can be hidden with
+`--status-line=off`. It is always absent in command and redirected modes.
 
 ## Commands
 

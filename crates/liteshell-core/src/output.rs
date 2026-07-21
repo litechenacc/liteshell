@@ -114,6 +114,16 @@ pub enum OutputEvent {
 
 pub trait OutputSink {
     fn emit(&mut self, event: OutputEvent);
+
+    /// Write raw standard-output bytes when the sink supports byte streams.
+    /// TUI sinks retain their text-only contract through this default method;
+    /// command-mode sinks override it to preserve binary pipeline data.
+    fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.emit(OutputEvent::Text(text.to_owned()));
+        Ok(())
+    }
 }
 
 #[derive(Default)]

@@ -1,9 +1,9 @@
 [package]
-name = "xtask"
+name = "liteshell-launcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
-sha2 = "=0.10.8"
-windows-sys.workspace = true
+[[bin]]
+name = "liteshell-launcher"
+path = "src/main.rs"

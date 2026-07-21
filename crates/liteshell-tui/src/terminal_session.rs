@@ -1,8 +1,4 @@
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -13,16 +9,11 @@ pub struct TerminalSession {
 impl TerminalSession {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut out = io::stdout();
-        if let Err(e) = execute!(out, EnterAlternateScreen, EnableMouseCapture) {
-            let _ = disable_raw_mode();
-            return Err(e);
-        }
+        let out = io::stdout();
         let terminal = match Terminal::new(CrosstermBackend::new(out)) {
             Ok(v) => v,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
                 return Err(e);
             }
         };
@@ -38,17 +29,15 @@ impl TerminalSession {
         if !self.active {
             return Ok(());
         }
-        let raw = disable_raw_mode();
-        let screen = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let result = disable_raw_mode();
         self.active = false;
-        raw.and(screen)
+        result
     }
     fn resume(&mut self) -> io::Result<()> {
         if self.active {
             return Ok(());
         }
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         self.active = true;
         self.terminal.as_mut().unwrap().clear()?;
         Ok(())

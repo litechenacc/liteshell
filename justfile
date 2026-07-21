@@ -14,7 +14,10 @@ test:
     cargo test --workspace
 
 release:
-    cargo build --release -p liteshell
+    cargo build --release -p liteshell -p liteshell-launcher
+
+install: release
+    cargo run --quiet -p xtask -- install
 
 fetch:
     cargo run -p xtask -- fetch
