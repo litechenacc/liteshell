@@ -7,13 +7,132 @@ use std::{
 };
 use thiserror::Error;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE},
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    Foundation::{CloseHandle, GlobalFree, HANDLE},
+    System::{
+        DataExchange::{
+            CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+            OpenClipboard, SetClipboardData,
+        },
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+        Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
     },
 };
+
+const CF_UNICODETEXT: u32 = 13;
+
+fn decode_clipboard_units(contents: &[u16]) -> String {
+    let end = contents
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(contents.len());
+    String::from_utf16_lossy(&contents[..end])
+}
+
+struct ClipboardGuard;
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseClipboard();
+        }
+    }
+}
+
+fn open_clipboard() -> std::io::Result<ClipboardGuard> {
+    let opened = (0..5).any(|attempt| {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            true
+        } else {
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        }
+    });
+    if opened {
+        Ok(ClipboardGuard)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Put UTF-8 text on the Windows clipboard as CF_UNICODETEXT. The movable
+/// allocation becomes clipboard-owned after SetClipboardData succeeds.
+pub fn set_clipboard_text(text: &str) -> std::io::Result<()> {
+    let mut contents: Vec<u16> = text.encode_utf16().collect();
+    contents.push(0);
+
+    let bytes = contents.len() * std::mem::size_of::<u16>();
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes) };
+    if memory.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let destination = unsafe { GlobalLock(memory) }.cast::<u16>();
+    if destination.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            GlobalFree(memory);
+        }
+        return Err(error);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(contents.as_ptr(), destination, contents.len());
+        GlobalUnlock(memory);
+    }
+
+    let _guard = match open_clipboard() {
+        Ok(guard) => guard,
+        Err(error) => {
+            unsafe {
+                GlobalFree(memory);
+            }
+            return Err(error);
+        }
+    };
+
+    if unsafe { EmptyClipboard() } == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            GlobalFree(memory);
+        }
+        return Err(error);
+    }
+    if unsafe { SetClipboardData(CF_UNICODETEXT, memory) }.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            GlobalFree(memory);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Read CF_UNICODETEXT from the Windows clipboard as UTF-8.
+pub fn get_clipboard_text() -> std::io::Result<Option<String>> {
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+        return Ok(None);
+    }
+    let _guard = open_clipboard()?;
+    let memory = unsafe { GetClipboardData(CF_UNICODETEXT) };
+    if memory.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let units = unsafe { GlobalSize(memory) } / std::mem::size_of::<u16>();
+    let source = unsafe { GlobalLock(memory) }.cast::<u16>();
+    if source.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let contents = unsafe { std::slice::from_raw_parts(source, units) };
+    let text = decode_clipboard_units(contents);
+    unsafe {
+        GlobalUnlock(memory);
+    }
+    Ok(Some(text))
+}
 
 /// A Windows Job Object that terminates attached process trees when LiteShell
 /// exits or is killed by a terminal-tool timeout.
@@ -409,6 +528,13 @@ mod tests {
     fn quoting() {
         assert_eq!(quote_windows_argument(OsStr::new("a b")), "\"a b\"");
         assert_eq!(quote_windows_argument(OsStr::new("")), "\"\"");
+    }
+
+    #[test]
+    fn clipboard_unicode_text_stops_at_the_nul_terminator() {
+        let mut contents: Vec<u16> = "中文 👩‍💻".encode_utf16().collect();
+        contents.extend([0, b'x' as u16]);
+        assert_eq!(decode_clipboard_units(&contents), "中文 👩‍💻");
     }
 
     #[test]

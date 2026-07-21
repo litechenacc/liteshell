@@ -10,6 +10,10 @@ impl Editor {
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
+    pub fn insert_str(&mut self, value: &str) {
+        self.text.insert_str(self.cursor, value);
+        self.cursor += value.len();
+    }
     pub fn previous(&self) -> usize {
         self.text[..self.cursor]
             .grapheme_indices(true)
@@ -60,5 +64,16 @@ mod tests {
         e.left();
         e.backspace();
         assert_eq!(e.text, "ae\u{301}");
+    }
+
+    #[test]
+    fn inserts_text_at_the_cursor() {
+        let mut editor = Editor {
+            text: "ac".into(),
+            cursor: 1,
+        };
+        editor.insert_str("中b");
+        assert_eq!(editor.text, "a中bc");
+        assert_eq!(editor.cursor, "a中b".len());
     }
 }
