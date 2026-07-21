@@ -3,11 +3,11 @@ use crossterm::event::{
 };
 use liteshell_builtins::{dispatch, Context, NAMES};
 use liteshell_core::{
-    config::{directory_db_path, history_path, load_startup_environment, Config},
+    config::{directory_db_path, history_path, load_startup, Config},
     directory_db::{frecency, now_epoch, DirectoryDb},
     history::History,
-    parser, AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider,
-    ShellState,
+    parser::{self, Aliases},
+    AppMode, OutputEvent, OutputSink, SearchCandidate, SearchKind, SearchProvider, ShellState,
 };
 use liteshell_fff::FffSearch;
 use liteshell_tui::{draw, CompletionSource, EventBuffer, TerminalSession, TuiState};
@@ -73,6 +73,11 @@ struct RunningTasks {
     deep_completion: Option<RunningDeepCompletion>,
 }
 
+struct InteractiveCommands {
+    resolver: WindowsCommandResolver,
+    aliases: Aliases,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("liteshell: {error}");
@@ -81,12 +86,12 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    load_startup_environment()?;
+    let startup = load_startup()?;
     let shell = ShellState::new(std::env::current_dir()?);
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        interactive(shell)
+        interactive(shell, startup.aliases)
     } else {
-        plain(shell)
+        plain(shell, startup.aliases)
     }
 }
 
@@ -120,7 +125,7 @@ impl OutputSink for PlainOutput {
     }
 }
 
-fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
+fn plain(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::error::Error>> {
     let resolver = WindowsCommandResolver;
     let mut output = PlainOutput;
     let config = Config::default();
@@ -133,7 +138,7 @@ fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
 
     for line in io::stdin().lock().lines() {
         let line = line?;
-        let arguments = match parser::parse(&line) {
+        let arguments = match parser::parse_with_aliases(&line, &aliases) {
             Ok(arguments) => arguments,
             Err(error) => {
                 eprintln!("parse: {error}");
@@ -183,7 +188,7 @@ fn plain(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> {
+fn interactive(mut shell: ShellState, aliases: Aliases) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();
     let mut history = History::new(history_path(), config.history_capacity);
     let _ = history.load();
@@ -193,7 +198,10 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
     let mut directory_db = DirectoryDb::new(directory_db_path());
     let _ = directory_db.load();
     directory_db.record(&shell.cwd);
-    let resolver = WindowsCommandResolver;
+    let commands = InteractiveCommands {
+        resolver: WindowsCommandResolver,
+        aliases,
+    };
     let mut state = TuiState::new(config.scrollback_lines, config.scrollback_bytes);
     let mut terminal = TerminalSession::enter()?;
     let mut running = RunningTasks::default();
@@ -485,7 +493,7 @@ fn interactive(mut shell: ShellState) -> Result<(), Box<dyn std::error::Error>> 
                                 &line,
                                 &mut shell,
                                 &mut search,
-                                &resolver,
+                                &commands,
                                 &mut state,
                                 &mut terminal,
                                 &mut running,
@@ -518,7 +526,7 @@ fn execute_interactive(
     line: &str,
     shell: &mut ShellState,
     search: &mut FffSearch,
-    resolver: &WindowsCommandResolver,
+    commands: &InteractiveCommands,
     state: &mut TuiState,
     terminal: &mut TerminalSession,
     running: &mut RunningTasks,
@@ -526,7 +534,7 @@ fn execute_interactive(
     state
         .output
         .push_text(&format!("{}{}\n", shell.prompt(), line), false);
-    let arguments = match parser::parse(line) {
+    let arguments = match parser::parse_with_aliases(line, &commands.aliases) {
         Ok(arguments) => arguments,
         Err(error) => {
             state.output.push_text(&format!("parse: {error}\n"), true);
@@ -560,7 +568,7 @@ fn execute_interactive(
             shell,
             output: &mut events,
             search,
-            resolver,
+            resolver: &commands.resolver,
             interactive: true,
         };
         dispatch(&arguments, &mut context)

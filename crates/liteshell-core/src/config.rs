@@ -1,3 +1,4 @@
+use crate::parser::{self, Aliases};
 use std::{collections::HashMap, io, path::PathBuf};
 use thiserror::Error;
 
@@ -78,17 +79,40 @@ pub enum StartupError {
         line: usize,
         name: String,
     },
+    #[error("{path}:{line}: expected alias NAME=value")]
+    InvalidAliasAssignment { path: PathBuf, line: usize },
+    #[error("{path}:{line}: invalid alias name '{name}'")]
+    InvalidAliasName {
+        path: PathBuf,
+        line: usize,
+        name: String,
+    },
+    #[error("{path}:{line}: invalid alias value: {source}")]
+    InvalidAliasValue {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: parser::ParseError,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StartupConfig {
+    pub path: Option<PathBuf>,
+    pub aliases: Aliases,
 }
 
 /// Load environment assignments from `~/.liteshellrc` before command
 /// resolution. The file is intentionally data-only: it does not execute shell
 /// commands. Values may reference earlier assignments or inherited variables
 /// using `%NAME%`, `$NAME`, or `${NAME}`.
-pub fn load_startup_environment() -> Result<Option<PathBuf>, StartupError> {
+pub fn load_startup() -> Result<StartupConfig, StartupError> {
     let path = startup_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(StartupConfig::default())
+        }
         Err(source) => {
             return Err(StartupError::Read {
                 path: path.clone(),
@@ -101,10 +125,46 @@ pub fn load_startup_environment() -> Result<Option<PathBuf>, StartupError> {
         .map(|(name, value)| (name.to_ascii_uppercase(), value))
         .collect();
     let mut assignments = Vec::new();
+    let mut aliases = Aliases::new();
     for (index, source) in contents.lines().enumerate() {
         let line_number = index + 1;
         let mut line = source.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(alias) = strip_keyword(line, "alias") {
+            let Some((name, raw_value)) = alias.split_once('=') else {
+                return Err(StartupError::InvalidAliasAssignment {
+                    path,
+                    line: line_number,
+                });
+            };
+            let name = name.trim();
+            if !valid_alias_name(name) {
+                return Err(StartupError::InvalidAliasName {
+                    path,
+                    line: line_number,
+                    name: name.to_owned(),
+                });
+            }
+            let value = unquote(raw_value.trim());
+            match parser::parse(value) {
+                Ok(arguments) if !arguments.is_empty() => {}
+                Ok(_) => {
+                    return Err(StartupError::InvalidAliasAssignment {
+                        path,
+                        line: line_number,
+                    })
+                }
+                Err(source) => {
+                    return Err(StartupError::InvalidAliasValue {
+                        path,
+                        line: line_number,
+                        source,
+                    })
+                }
+            }
+            aliases.insert(name.to_owned(), value.to_owned());
             continue;
         }
         if let Some(value) = line.strip_prefix("export ") {
@@ -156,7 +216,42 @@ pub fn load_startup_environment() -> Result<Option<PathBuf>, StartupError> {
     for (name, value) in assignments {
         std::env::set_var(name, value);
     }
-    Ok(Some(path))
+    Ok(StartupConfig {
+        path: Some(path),
+        aliases,
+    })
+}
+
+/// Compatibility helper for callers that only need startup environment values.
+pub fn load_startup_environment() -> Result<Option<PathBuf>, StartupError> {
+    load_startup().map(|startup| startup.path)
+}
+
+fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    line.strip_prefix(keyword).and_then(|rest| {
+        rest.chars()
+            .next()
+            .filter(|ch| ch.is_whitespace())
+            .map(|_| rest.trim_start())
+    })
+}
+
+fn unquote(value: &str) -> &str {
+    if value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn valid_alias_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -241,5 +336,14 @@ mod startup_tests {
         assert!(valid_environment_name("SDK_VERSION"));
         assert!(!valid_environment_name("BAD-NAME"));
         assert!(!valid_environment_name("1BAD"));
+    }
+
+    #[test]
+    fn alias_names_allow_command_like_characters() {
+        assert!(valid_alias_name("ll"));
+        assert!(valid_alias_name("git-lg"));
+        assert!(valid_alias_name(".."));
+        assert!(!valid_alias_name("bad name"));
+        assert!(!valid_alias_name("bad=alias"));
     }
 }

@@ -21,8 +21,24 @@ reference inherited variables or earlier assignments with `%NAME%`, `$NAME`, or
 `${NAME}`. Single-quoted values are literal; double-quoted and unquoted values
 are expanded.
 
-The file is deliberately data-only. LiteShell does not execute startup commands,
-profiles, or plugins from it.
+The same file accepts bash-style command aliases. Alias expansion applies only
+to the command name, supports chained aliases, and appends arguments entered at
+the prompt to the alias value:
+
+```text
+alias l='ls'
+alias ll='ls -l'
+alias la='ls -la'
+alias lg='lazygit'
+alias vi='nvim'
+```
+
+Alias names are case-sensitive. Alias values use LiteShell's normal quoting and
+environment-variable expansion rules when invoked. An alias may refer to its
+own command name (for example, `alias ls='ls -a'`) without expanding forever.
+
+The file is deliberately data-only. LiteShell reads assignments and alias
+definitions but does not execute startup commands, profiles, or plugins from it.
 
 `LITESHELL_DEEP_SEARCH_EXCLUDE_DIRS` controls directory basenames pruned from
 recursive `cd *query` searches. Values are separated by semicolons and matching

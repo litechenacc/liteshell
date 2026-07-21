@@ -72,6 +72,10 @@ without terminal initialization or ANSI escapes:
 `cd`, `pwd`, `ls`, `cat`, `tail`, `less`, `clear`, `which`, `find`, `rg`, `help`,
 `exit`, and foreground `.exe`, `.com`, `.cmd`, `.bat`, and `.ps1` commands.
 
+Command aliases can be declared in `~/.liteshellrc`, for example
+`alias ll='ls -l'`, `alias lg='lazygit'`, and `alias vi='nvim'`. See
+[`docs/configuration.md`](docs/configuration.md) for details.
+
 ## Architecture
 
 - `liteshell-core`: parser, editor, history, shell state, and output/search traits

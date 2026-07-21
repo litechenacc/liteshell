@@ -1,4 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+pub type Aliases = HashMap<String, String>;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ParseError {
@@ -117,6 +120,32 @@ pub fn parse(line: &str) -> Result<Vec<String>, ParseError> {
     Ok(args)
 }
 
+/// Parse a command line and expand aliases in command position. Alias values
+/// are parsed with the same quoting and environment expansion rules as normal
+/// input, while arguments supplied by the caller are appended unchanged.
+pub fn parse_with_aliases(line: &str, aliases: &Aliases) -> Result<Vec<String>, ParseError> {
+    let mut args = parse(line)?;
+    let mut expanded = HashSet::new();
+
+    while let Some(command) = args.first() {
+        let Some(value) = aliases.get(command) else {
+            break;
+        };
+        if !expanded.insert(command.clone()) {
+            break;
+        }
+
+        let mut replacement = parse(value)?;
+        if replacement.is_empty() {
+            break;
+        }
+        replacement.extend(args.drain(1..));
+        args = replacement;
+    }
+
+    Ok(args)
+}
+
 fn env(name: &str) -> String {
     std::env::var(name)
         .or_else(|_| {
@@ -158,5 +187,21 @@ mod tests {
     #[test]
     fn windows_backslashes_survive() {
         assert_eq!(parse(r#"cd C:\work\x"#).unwrap()[1], r#"C:\work\x"#);
+    }
+    #[test]
+    fn aliases_expand_recursively_and_keep_user_arguments() {
+        let aliases = Aliases::from([("l".into(), "ll".into()), ("ll".into(), "ls -la".into())]);
+        assert_eq!(
+            parse_with_aliases("l src", &aliases).unwrap(),
+            ["ls", "-la", "src"]
+        );
+    }
+    #[test]
+    fn self_referencing_aliases_expand_only_once() {
+        let aliases = Aliases::from([("ls".into(), "ls -a".into())]);
+        assert_eq!(
+            parse_with_aliases("ls docs", &aliases).unwrap(),
+            ["ls", "-a", "docs"]
+        );
     }
 }
